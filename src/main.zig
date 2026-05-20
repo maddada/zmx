@@ -35,6 +35,7 @@ var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
+const ghostexRefreshSequence = "\x1b]1337;ZMX_REFRESH\x07";
 
 const SessionMatch = struct {
     name: []const u8,
@@ -258,6 +259,20 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         return send(&cfg, sesh, socket_path, text_parts.items, .Output);
+    } else if (std.mem.eql(u8, cmd, "refresh") or std.mem.eql(u8, cmd, "re")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        return refresh(&cfg, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -454,6 +469,7 @@ const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    is_terminal: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -931,6 +947,39 @@ const Daemon = struct {
         return error.NoLeaderFound;
     }
 
+    fn appendVisibleRefresh(self: *Daemon, client: *Client, term: *ghostty_vt.Terminal) void {
+        if (!self.has_pty_output) return;
+        if (util.serializeVisibleTerminalState(self.alloc, term)) |term_output| {
+            std.log.debug("serialize visible terminal state", .{});
+            const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse term_output;
+            defer self.alloc.free(term_output);
+            defer if (restore_data.ptr != term_output.ptr) self.alloc.free(restore_data);
+            ipc.appendMessage(self.alloc, &client.write_buf, .Output, restore_data) catch |err| {
+                std.log.warn(
+                    "failed to buffer visible terminal refresh for client err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            client.has_pending_output = true;
+        }
+    }
+
+    pub fn handleRefresh(self: *Daemon, requesting_client: *Client, term: *ghostty_vt.Terminal) !void {
+        // CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex refreshes stale zmx-backed panes by asking the zmx daemon to repaint attached terminal clients from tracked VT state. This is intentionally an IPC/display operation, never PTY input, so refresh cannot type escape bytes into the user's shell.
+        var refreshed_count: usize = 0;
+        for (self.clients.items) |client| {
+            if (!client.is_terminal) continue;
+            self.appendVisibleRefresh(client, term);
+            refreshed_count += 1;
+        }
+        if (refreshed_count == 0) {
+            self.appendVisibleRefresh(requesting_client, term);
+        }
+        try ipc.appendMessage(self.alloc, &requesting_client.write_buf, .Ack, "");
+        requesting_client.has_pending_output = true;
+    }
+
     pub fn handleInit(
         self: *Daemon,
         client: *Client,
@@ -939,6 +988,7 @@ const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        client.is_terminal = true;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -1264,6 +1314,7 @@ fn help() !void {
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
+        \\  [re]fresh <name>                         Repaint attached terminal clients
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
@@ -1335,6 +1386,10 @@ fn help() !void {
         \\  Examples:
         \\    printf '\\r\\nhello\\r\\n' | zmx print dev
         \\    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
+        \\
+        \\Refresh:
+        \\  Repaints attached terminal clients from zmx's tracked terminal state.
+        \\  It does not send input to the PTY and the shell sees nothing.
         \\
         \\Write:
         \\  Writes stdin to file_path inside the session. Works over SSH.
@@ -2189,6 +2244,52 @@ fn send(cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts
     };
 }
 
+fn refresh(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(dir, session_name);
+            try w.interface.print("cleaned up stale session {s}\n", .{session_name});
+        } else {
+            try w.interface.print(
+                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
+                .{ session_name, @errorName(err) },
+            );
+        }
+        try w.interface.flush();
+        return;
+    };
+    defer posix.close(probe_result.fd);
+
+    ipc.send(probe_result.fd, .Refresh, "") catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const n = sb.read(probe_result.fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .Ack) {
+            try w.interface.print("refresh requested {s}\n", .{session_name});
+            try w.interface.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
+}
+
 fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
     var buf: [4096]u8 = undefined;
@@ -2291,6 +2392,48 @@ const ClientResult = struct {
     session_name: ?[]const u8,
 };
 
+fn appendClientInputMessages(alloc: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
+    // CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex sends a private OSC refresh request through the attached terminal because that path is already connected to the correct zmx client. zmx must consume that exact sequence locally and convert it to Refresh IPC so the shell/PTY never receives the control bytes.
+    var remaining = input;
+    while (std.mem.indexOf(u8, remaining, ghostexRefreshSequence)) |index| {
+        if (index > 0) {
+            try ipc.appendMessage(alloc, sock_write_buf, .Input, remaining[0..index]);
+        }
+        try ipc.appendMessage(alloc, sock_write_buf, .Refresh, "");
+        remaining = remaining[index + ghostexRefreshSequence.len ..];
+    }
+    if (remaining.len > 0) {
+        try ipc.appendMessage(alloc, sock_write_buf, .Input, remaining);
+    }
+}
+
+test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendClientInputMessages(alloc, &out, "before" ++ ghostexRefreshSequence ++ "after");
+
+    var offset: usize = 0;
+    const first_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Input, first_header.tag);
+    const first_len: usize = @intCast(first_header.len);
+    try std.testing.expectEqualStrings("before", out.items[offset..][0..first_len]);
+    offset += first_len;
+
+    const refresh_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Refresh, refresh_header.tag);
+    try std.testing.expectEqual(@as(u32, 0), refresh_header.len);
+
+    const second_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Input, second_header.tag);
+    const second_len: usize = @intCast(second_header.len);
+    try std.testing.expectEqualStrings("after", out.items[offset..][0..second_len]);
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 fn clientLoop(client_sock_fd: i32) !ClientResult {
@@ -2385,7 +2528,7 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
                     if (util.isCtrlBackslash(buf[0..n])) {
                         try ipc.appendMessage(alloc, &sock_write_buf, .Detach, "");
                     } else {
-                        try ipc.appendMessage(alloc, &sock_write_buf, .Input, buf[0..n]);
+                        try appendClientInputMessages(alloc, &sock_write_buf, buf[0..n]);
                     }
                 } else {
                     // EOF on stdin
@@ -2691,6 +2834,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         },
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
+                        .Refresh => try daemon.handleRefresh(client, &term),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .Ack, .TaskComplete => {},
                         .Write => try daemon.handleWrite(client, msg.payload),

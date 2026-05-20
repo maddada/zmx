@@ -585,6 +585,64 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     };
 }
 
+pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex can ask an already attached zmx client to repaint a stale visible pane. Refresh output must not include scrollback because the client already owns that history; emit only a clear-and-repaint snapshot of the active viewport so no bytes reach the PTY and no scrollback is duplicated.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, false);
+    }
+    defer if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, true);
+    };
+
+    builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    const pages = &term.screens.active.pages;
+    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
+    const active_br = pages.pin(.{
+        .active = .{
+            .x = @intCast(pages.cols - 1),
+            .y = @intCast(pages.rows - 1),
+        },
+    });
+
+    if (active_tl != null and active_br != null) {
+        vis_fmt.content = .{
+            .selection = ghostty_vt.Selection.init(
+                active_tl.?,
+                active_br.?,
+                false,
+            ),
+        };
+    }
+    vis_fmt.extra = .{
+        .palette = false,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = false,
+        .pwd = true,
+        .keyboard = true,
+        .screen = .all,
+    };
+
+    vis_fmt.format(&builder.writer) catch |err| {
+        std.log.warn("failed to format visible terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
+
+    const output = builder.writer.buffered();
+    if (output.len == 0) return null;
+
+    return alloc.dupe(u8, output) catch |err| {
+        std.log.warn("failed to allocate visible terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
 pub const HistoryFormat = enum(u8) {
     plain = 0,
     vt = 1,

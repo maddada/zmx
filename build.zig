@@ -28,10 +28,18 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", options);
 
-    const dep = b.dependency("ghostty", .{
+    // CDXC:ZmxPersistence 2026-05-20-10:23:
+    // Ghostex bundles zmx from this submodule during `bun run start`.
+    // zmx only imports Ghostty's `ghostty-vt` Zig module, so keep the dependency in lib-vt mode and disable Ghostty's macOS app/xcframework outputs; those extra artifacts can require host SDK discovery that is unrelated to zmx and should not block local Ghostex starts.
+    const ghostty_dep_options = .{
         .target = target,
         .optimize = optimize,
-    });
+        .@"emit-lib-vt" = true,
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
+    };
+
+    const dep = b.dependency("ghostty", ghostty_dep_options);
     exe_mod.addImport(
         "ghostty-vt",
         dep.module("ghostty-vt"),
@@ -60,10 +68,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        const test_dep = b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-        });
+        const test_dep = b.dependency("ghostty", ghostty_dep_options);
         test_module.addImport(
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
@@ -118,6 +123,9 @@ pub fn build(b: *std.Build) void {
             if (b.lazyDependency("ghostty", .{
                 .target = resolved,
                 .optimize = .ReleaseSafe,
+                .@"emit-lib-vt" = true,
+                .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
             }
