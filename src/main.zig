@@ -135,7 +135,12 @@ pub fn main() !void {
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
+        var restore_visible_only = false;
+        var session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--visible-only")) {
+            restore_visible_only = true;
+            session_name = args.next() orelse "";
+        }
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
             return help();
         }
@@ -143,6 +148,10 @@ pub fn main() !void {
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--visible-only")) {
+                restore_visible_only = true;
+                continue;
+            }
             try command_args.append(alloc, arg);
         }
 
@@ -175,7 +184,7 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon);
+        return attach(&daemon, restore_visible_only);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -987,8 +996,9 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len < @sizeOf(ipc.Resize)) return;
         client.is_terminal = true;
+        const restore_visible_only = payload.len > @sizeOf(ipc.Resize) and payload[@sizeOf(ipc.Resize)] == 1;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -1001,7 +1011,14 @@ const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
+            // CDXC:ZmxMobileAttach 2026-05-23-19:58:
+            // iPhone attach clients cannot safely ingest a full scrollback replay before UIKit gets touch turns.
+            // The --visible-only attach mode restores only the active viewport on reattach while preserving normal desktop zmx attach behavior for terminals that can handle full scrollback restoration.
+            const maybe_term_output = if (restore_visible_only)
+                util.serializeVisibleTerminalState(self.alloc, term)
+            else
+                util.serializeTerminalState(self.alloc, term);
+            if (maybe_term_output) |term_output| {
                 std.log.debug("serialize terminal state", .{});
                 // Rewrite OSC 133;A to include redraw=0 so the outer terminal
                 // does not clear prompt lines on resize (issue #111).
@@ -1310,7 +1327,7 @@ fn help() !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach <name> [command...]             Attach to session, creating if needed
+        \\  [a]ttach [--visible-only] <name> [command...]  Attach to session, creating if needed
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -1329,9 +1346,11 @@ fn help() !void {
         \\Attach:
         \\  This will spawn a login $SHELL with a PTY.  You can provide a
         \\  command instead of creating a shell.
+        \\  --visible-only restores only the active viewport on reattach.
         \\
         \\  Examples:
         \\    zmx attach dev
+        \\    zmx attach --visible-only dev
         \\    zmx attach dev vim
         \\
         \\History:
@@ -1999,7 +2018,7 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     };
 }
 
-fn attach(daemon: *Daemon) !void {
+fn attach(daemon: *Daemon, restore_visible_only: bool) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(daemon, sesh);
@@ -2056,7 +2075,7 @@ fn attach(daemon: *Daemon) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock);
+    const looper = try clientLoop(client_sock, restore_visible_only);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2088,7 +2107,7 @@ fn attach(daemon: *Daemon) !void {
                     .created_at = @intCast(std.time.timestamp()),
                     .leader_client_fd = null,
                 };
-                return attach(&target_daemon);
+                return attach(&target_daemon, restore_visible_only);
             }
         },
     }
@@ -2436,7 +2455,7 @@ test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32) !ClientResult {
+fn clientLoop(client_sock_fd: i32, restore_visible_only: bool) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2455,7 +2474,10 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    try ipc.appendMessage(alloc, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    var init_payload: [@sizeOf(ipc.Resize) + 1]u8 = undefined;
+    @memcpy(init_payload[0..@sizeOf(ipc.Resize)], std.mem.asBytes(&size));
+    init_payload[@sizeOf(ipc.Resize)] = if (restore_visible_only) 1 else 0;
+    try ipc.appendMessage(alloc, &sock_write_buf, .Init, &init_payload);
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
