@@ -999,12 +999,27 @@ const Daemon = struct {
         if (payload.len < @sizeOf(ipc.Resize)) return;
         client.is_terminal = true;
         const restore_visible_only = payload.len > @sizeOf(ipc.Resize) and payload[@sizeOf(ipc.Resize)] == 1;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+
+        // no leader is set so set one
+        if (self.leader_client_fd == null) {
+            try self.setLeader(client);
+        }
+        const is_leader = self.leader_client_fd == client.socket_fd;
+        var resized_before_restore = false;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
         // Only serialize on re-attach (has_had_client), not first attach, to avoid
         // interfering with shell initialization (DA1 queries, etc.)
+        if (restore_visible_only and is_leader and self.has_pty_output and self.has_had_client) {
+            // CDXC:ZmxMobileAttach 2026-05-23-13:18:
+            // Ghostex iPhone attach uses --visible-only specifically because the phone cannot absorb desktop-sized scrollback.
+            // Resize the daemon terminal to the iPhone PTY before serializing the visible snapshot so the loaded session is rendered for the phone grid instead of replaying desktop-width rows that wrap and leave blank bands.
+            try self.applyTerminalResize(pty_fd, term, resize);
+            resized_before_restore = true;
+        }
         if (self.has_pty_output and self.has_had_client) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
@@ -1035,36 +1050,43 @@ const Daemon = struct {
             }
         }
 
-        // no leader is set so set one
-        if (self.leader_client_fd == null) {
-            try self.setLeader(client);
-        }
-
         // only resize if leader
-        if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = 0,
-                .ws_ypixel = 0,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            try term.resize(self.alloc, resize.cols, resize.rows);
+        if (is_leader and !resized_before_restore) {
+            try self.applyTerminalResize(pty_fd, term, resize);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
             self.has_terminal_client = true;
 
             std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+        } else if (is_leader) {
+            self.has_had_client = true;
+            self.has_terminal_client = true;
+            std.log.debug("init visible-only pre-restore resize rows={d} cols={d}", .{ resize.rows, resize.cols });
         }
+    }
+
+    fn applyTerminalResize(
+        self: *Daemon,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        resize: ipc.Resize,
+    ) !void {
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = 0,
+            .ws_ypixel = 0,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        // Disable prompt_redraw before resize. The daemon's internal terminal
+        // would otherwise clear prompt lines expecting the shell to redraw them,
+        // but the shell's redraw goes to the PTY (forwarded to clients), not to
+        // this daemon terminal. The clearing corrupts the daemon's snapshot state.
+        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        try term.resize(self.alloc, resize.cols, resize.rows);
     }
 
     pub fn handleResize(
@@ -1082,18 +1104,7 @@ const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize (same rationale as handleInit).
-        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        try term.resize(self.alloc, resize.cols, resize.rows);
+        try self.applyTerminalResize(pty_fd, term, resize);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
