@@ -342,7 +342,7 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
         if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
             return exit_code;
         } else |_| {
-            std.log.warn("failed to parse task exit code from: {s}", .{exit_code_str});
+            std.log.warn("failed to parse task exit code len={d}", .{exit_code_str.len});
             return null;
         }
     }

@@ -183,7 +183,7 @@ pub fn main() !void {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
-        std.log.info("socket path={s}", .{daemon.socket_path});
+        std.log.info("socket path=<redacted>", .{});
         return attach(&daemon, restore_visible_only);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
@@ -226,7 +226,7 @@ pub fn main() !void {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
-        std.log.info("socket path={s}", .{daemon.socket_path});
+        std.log.info("socket path=<redacted>", .{});
         return run(&daemon, detached, cmd_args_raw.items);
     } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
@@ -464,7 +464,7 @@ pub fn main() !void {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
-        std.log.info("socket path={s}", .{daemon.socket_path});
+        std.log.info("socket path=<redacted>", .{});
         try writeFile(&daemon, file_path);
     } else {
         return help();
@@ -635,7 +635,7 @@ const Daemon = struct {
     }
 
     pub fn shutdown(self: *Daemon) void {
-        std.log.info("shutting down daemon session={s}", .{self.session_name});
+        std.log.info("shutting down daemon session=<redacted>", .{});
         self.running = false;
 
         for (self.clients.items) |client| {
@@ -650,8 +650,8 @@ const Daemon = struct {
         // leader is disconnected, remove ref and let another client claim leader on input
         if (self.leader_client_fd == client.socket_fd) {
             std.log.info(
-                "unsetting leader session={s} fd={d}",
-                .{ self.session_name, client.socket_fd },
+                "unsetting leader session=<redacted> fd={d}",
+                .{client.socket_fd},
             );
             self.leader_client_fd = null;
         }
@@ -704,7 +704,7 @@ const Daemon = struct {
                 argv[i] = try alloc.dupeZ(u8, arg);
             }
             const err = std.posix.execvpeZ(argv[0].?, argv.ptr, std.c.environ);
-            std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd_args[0], @errorName(err) });
+            std.log.err("execvpe failed: cmd=<redacted> err={s}", .{@errorName(err)});
             std.posix.exit(1);
         }
 
@@ -751,7 +751,7 @@ const Daemon = struct {
         }
         // master pid code path
         self.pid = pid;
-        std.log.info("pty spawned session={s} pid={d}", .{ self.session_name, pid });
+        std.log.info("pty spawned session=<redacted> pid={d}", .{pid});
 
         // make pty non-blocking
         const flags = try posix.fcntl(master_fd, posix.F.GETFL, 0);
@@ -773,8 +773,8 @@ const Daemon = struct {
                 posix.close(fd);
                 if (self.command != null) {
                     std.log.warn(
-                        "session already exists, ignoring command session={s}",
-                        .{self.session_name},
+                        "session already exists, ignoring command session=<redacted>",
+                        .{},
                     );
                 }
             } else |err| switch (err) {
@@ -788,15 +788,15 @@ const Daemon = struct {
                 // to attach rather than fail or orphan.
                 else => {
                     std.log.warn(
-                        "connect failed ({s}), proceeding to attach session={s}",
-                        .{ @errorName(err), self.session_name },
+                        "connect failed ({s}), proceeding to attach session=<redacted>",
+                        .{@errorName(err)},
                     );
                 },
             }
         }
 
         if (should_create) {
-            std.log.info("creating session={s}", .{self.session_name});
+            std.log.info("creating session=<redacted>", .{});
             const server_sock_fd = try socket.createSocket(self.socket_path);
 
             // creates the daemon
@@ -850,10 +850,12 @@ const Daemon = struct {
                     }
                 }
 
+                // CDXC:ZmxDiagnosticsPrivacy 2026-05-31-00:18:
+                // Users must be able to zip and send zmx log directories without exposing session names. Use the daemon process id in the per-session log filename so support can still correlate child-daemon logs without leaking the user-provided session label.
                 const session_log_name = try std.fmt.allocPrint(
                     self.alloc,
-                    "{s}.log",
-                    .{self.session_name},
+                    "zmx-daemon-{d}.log",
+                    .{std.c.getpid()},
                 );
                 defer self.alloc.free(session_log_name);
                 const session_log_path = try std.fs.path.join(
@@ -878,7 +880,7 @@ const Daemon = struct {
                     posix.close(pty_fd);
                     _ = posix.waitpid(self.pid, 0);
                     posix.close(server_sock_fd);
-                    std.log.info("deleting socket file session={s}", .{self.session_name});
+                    std.log.info("deleting socket file session=<redacted>", .{});
                     dir.deleteFile(self.session_name) catch |err| {
                         std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
                     };
@@ -911,7 +913,7 @@ const Daemon = struct {
             );
             return;
         }
-        std.log.debug("buffering pty input data={x}", .{data});
+        std.log.debug("buffering pty input len={d}", .{data.len});
         self.pty_write_buf.appendSlice(self.alloc, data) catch |err| {
             std.log.warn(
                 "pty input dropped {d} bytes: {s}",
@@ -921,7 +923,7 @@ const Daemon = struct {
     }
 
     pub fn handleInput(self: *Daemon, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
+        std.log.debug("buffering pty input len={d}", .{payload.len});
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(payload);
@@ -1109,7 +1111,7 @@ const Daemon = struct {
     }
 
     pub fn handleDetach(self: *Daemon, client: *Client, i: usize) void {
-        std.log.info("client detach session={s} fd={d}", .{ self.session_name, client.socket_fd });
+        std.log.info("client detach session=<redacted> fd={d}", .{client.socket_fd});
         _ = self.closeClient(client, i, false);
     }
 
@@ -1123,13 +1125,13 @@ const Daemon = struct {
     }
 
     pub fn handleKill(self: *Daemon) void {
-        std.log.info("kill received session={s}", .{self.session_name});
+        std.log.info("kill received session=<redacted>", .{});
         self.shutdown();
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
         // instead
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
         // negative pid means kill process and children
-        std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
+        std.log.info("sending SIGHUP session=<redacted> pid={d}", .{self.pid});
         posix.kill(-self.pid, posix.SIG.HUP) catch |err| {
             std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
         };
@@ -1222,7 +1224,7 @@ const Daemon = struct {
             var name_buf: [64]u8 = undefined;
             if (cross.getForegroundProcessName(self.pty_fd, &name_buf)) |name| {
                 self.is_fish = std.mem.eql(u8, name, "fish");
-                std.log.debug("foreground process={s} is_fish={}", .{ name, self.is_fish });
+                std.log.debug("foreground process=<redacted> is_fish={}", .{self.is_fish});
             }
         }
         const cmd = payload;
@@ -1307,8 +1309,8 @@ const Daemon = struct {
         client.has_pending_output = true;
         self.has_had_client = true;
         std.log.debug(
-            "write command len={d} file_path={s}",
-            .{ file_content.len, file_path },
+            "write command len={d} file_path=<redacted>",
+            .{file_content.len},
         );
     }
 };
@@ -2039,7 +2041,7 @@ fn attach(daemon: *Daemon, restore_visible_only: bool) !void {
     if (result.is_daemon) return;
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
-    std.log.info("attached session={s}", .{daemon.session_name});
+    std.log.info("attached session=<redacted>", .{});
     //  This is typically used with tcsetattr() to modify terminal settings.
     //      - you first get the current settings with tcgetattr()
     //      - modify the desired attributes in the termios structure
@@ -2646,7 +2648,7 @@ fn clientLoop(client_sock_fd: i32, restore_visible_only: bool) !ClientResult {
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
-    std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
+    std.log.info("daemon started session=<redacted> pty_fd={d}", .{pty_fd});
     daemon.pty_fd = pty_fd;
     try openSignalPipe();
     installWakeHandler(posix.SIG.TERM);
@@ -2701,8 +2703,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
             std.log.info(
-                "SIGTERM received, shutting down gracefully session={s}",
-                .{daemon.session_name},
+                "SIGTERM received, shutting down gracefully session=<redacted>",
+                .{},
             );
             break :daemon_loop;
         }
