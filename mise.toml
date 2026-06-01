@@ -1,3 +1,5 @@
+# CDXC:Toolchain 2026-06-01-10:45:
+# zmx depends on Ghostty packages that require Zig 0.15.2. Keep this project-local mise pin so zmx builds do not accidentally use the newer Zig required by sibling projects such as zehn.
 [tools]
 zig = "0.15.2"
 zls = "0.15.1"

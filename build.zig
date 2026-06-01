@@ -10,6 +10,12 @@ const macos_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
+// CDXC:ZmxBuild 2026-06-01-10:45:
+// Ghostex builds zmx for macOS during local start and app packaging. Zig 0.15.2 cannot link Mach-O with LLD, so keep LLVM enabled but let macOS targets use Zig's supported linker while preserving LLD for non-macOS targets.
+fn useLldForTarget(target: std.Build.ResolvedTarget) bool {
+    return target.result.os.tag != .macos;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -51,7 +57,7 @@ pub fn build(b: *std.Build) void {
         const exe = b.addExecutable(.{
             .name = "zmx",
             .use_llvm = true,
-            .use_lld = true,
+            .use_lld = useLldForTarget(target),
             .root_module = exe_mod,
         });
         exe.linkLibC();
@@ -78,7 +84,7 @@ pub fn build(b: *std.Build) void {
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             .use_llvm = true,
-            .use_lld = true,
+            .use_lld = useLldForTarget(target),
         });
         exe_unit_tests.linkLibC();
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -99,7 +105,7 @@ pub fn build(b: *std.Build) void {
         const exe_check = b.addExecutable(.{
             .name = "zmx",
             .use_llvm = true,
-            .use_lld = true,
+            .use_lld = useLldForTarget(target),
             .root_module = exe_mod,
         });
         exe_check.linkLibC();
@@ -139,7 +145,7 @@ pub fn build(b: *std.Build) void {
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
                 .use_llvm = true,
-                .use_lld = true,
+                .use_lld = useLldForTarget(resolved),
                 .root_module = release_mod,
             });
             release_exe.linkLibC();
