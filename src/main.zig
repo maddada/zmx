@@ -6,6 +6,7 @@ const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const completions = @import("completions.zig");
 const util = @import("util.zig");
+const title_events = @import("title_events.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 
@@ -282,6 +283,20 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         return refresh(&cfg, sesh, socket_path);
+    } else if (std.mem.eql(u8, cmd, "watch-title")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        return watchTitle(&cfg, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
         var stderr_buffer: [1024]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -479,6 +494,7 @@ const Client = struct {
     socket_fd: i32,
     has_pending_output: bool = false,
     is_terminal: bool = false,
+    is_title_watcher: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -622,6 +638,7 @@ const Daemon = struct {
     is_fish: bool = false, // true if session shell is fish (affects exit code variable)
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    title_coalescer: title_events.Coalescer = .{},
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -631,6 +648,7 @@ const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
+        self.title_coalescer.deinit(self.alloc);
         self.alloc.free(self.socket_path);
     }
 
@@ -1145,7 +1163,15 @@ const Daemon = struct {
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
-        info.clients_len = self.clients.items.len - 1;
+        // CDXC:ZmxTitleObservations 2026-06-01-10:17:
+        // gxserver keeps a long-lived title watcher attached to each observed zmx session. That watcher is process plumbing, not a user-visible client, so `zmx list` client counts must ignore it while still excluding this transient Info request.
+        var visible_client_count: usize = 0;
+        for (self.clients.items) |existing_client| {
+            if (!existing_client.is_title_watcher) {
+                visible_client_count += 1;
+            }
+        }
+        info.clients_len = if (visible_client_count > 0) visible_client_count - 1 else 0;
         info.pid = self.pid;
         info.created_at = self.created_at;
         info.task_ended_at = self.task_ended_at orelse 0;
@@ -1209,6 +1235,48 @@ const Daemon = struct {
         }
     }
 
+    pub fn handleTitleSubscribe(self: *Daemon, client: *Client, term: *ghostty_vt.Terminal) !void {
+        client.is_title_watcher = true;
+        // CDXC:ZmxTitleObservations 2026-06-01-10:17:
+        // Title watchers should not receive the raw title captured at subscription time unless zmx has already emitted it as stable. New or restored surfaces can briefly expose shell/bootstrap titles before the agent redraws, so the first observed title must pass through the same 1s debounce and 6s max-settle window as later changes.
+        if (self.title_coalescer.lastEmittedTitle()) |title| {
+            try self.sendTitleToClient(client, title);
+        }
+        if (term.getTitle()) |title| {
+            try self.title_coalescer.observe(self.alloc, title, std.time.milliTimestamp());
+        }
+    }
+
+    pub fn observeTerminalTitle(self: *Daemon, title: []const u8) !void {
+        try self.title_coalescer.observe(self.alloc, title, std.time.milliTimestamp());
+    }
+
+    pub fn titlePollTimeoutMs(self: *const Daemon) i32 {
+        return self.title_coalescer.pollTimeoutMs(std.time.milliTimestamp());
+    }
+
+    pub fn flushTitleIfDue(self: *Daemon) !void {
+        const title = try self.title_coalescer.takeDue(self.alloc, std.time.milliTimestamp());
+        if (title) |value| {
+            defer self.alloc.free(value);
+            try self.broadcastTitle(value);
+        }
+    }
+
+    fn broadcastTitle(self: *Daemon, title: []const u8) !void {
+        for (self.clients.items) |client| {
+            if (!client.is_title_watcher) {
+                continue;
+            }
+            try self.sendTitleToClient(client, title);
+        }
+    }
+
+    fn sendTitleToClient(self: *Daemon, client: *Client, title: []const u8) !void {
+        try ipc.appendMessage(self.alloc, &client.write_buf, .TitleObserved, title);
+        client.has_pending_output = true;
+    }
+
     pub fn handleRun(self: *Daemon, client: *Client, payload: []const u8) !void {
         // Reset task tracking so the new command's exit marker is detected.
         // Without this, a second `zmx run` on the same session is ignored
@@ -1254,6 +1322,9 @@ const Daemon = struct {
         vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
+            if (client.is_title_watcher) {
+                continue;
+            }
             try ipc.appendMessage(self.alloc, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }
@@ -1352,6 +1423,7 @@ fn help() !void {
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
+        \\  watch-title <name>                       Stream coalesced terminal title observations as JSON lines
         \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish)
         \\  [v]ersion                                Show version
         \\  [h]elp                                   Show this help
@@ -2322,6 +2394,37 @@ fn refresh(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !void {
     return error.NoAckReceived;
 }
 
+fn watchTitle(_: *Cfg, _: []const u8, socket_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    const client_sock = try socket.sessionConnect(socket_path);
+    defer posix.close(client_sock);
+    try ipc.send(client_sock, .TitleSubscribe, "");
+
+    var read_buf = try ipc.SocketBuffer.init(alloc);
+    defer read_buf.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    while (true) {
+        const n = read_buf.read(client_sock) catch |err| switch (err) {
+            error.ConnectionResetByPeer, error.BrokenPipe => return,
+            else => return err,
+        };
+        if (n == 0) {
+            return;
+        }
+        while (read_buf.next()) |msg| {
+            if (msg.header.tag != .TitleObserved) {
+                continue;
+            }
+            try title_events.writeTitleJsonLine(stdout, msg.payload);
+            try stdout.flush();
+        }
+    }
+}
+
 fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
     const alloc = daemon.alloc;
     var buf: [4096]u8 = undefined;
@@ -2698,7 +2801,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             });
         }
 
-        _ = try posix.poll(poll_fds.items, -1);
+        _ = try posix.poll(poll_fds.items, daemon.titlePollTimeoutMs());
+        try daemon.flushTitleIfDue();
 
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
@@ -2751,6 +2855,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
+                    if (term.getTitle()) |title| {
+                        try daemon.observeTerminalTitle(title);
+                    }
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -2775,6 +2882,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
+                                if (c.is_title_watcher) {
+                                    continue;
+                                }
                                 ipc.appendMessage(daemon.alloc, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -2787,6 +2897,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     const broadcast_data = util.rewritePromptRedraw(daemon.alloc, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) daemon.alloc.free(broadcast_data);
                     for (daemon.clients.items) |client| {
+                        if (client.is_title_watcher) {
+                            continue;
+                        }
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -2871,7 +2984,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Refresh => try daemon.handleRefresh(client, &term),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Ack, .TaskComplete => {},
+                        .TitleSubscribe => try daemon.handleTitleSubscribe(client, &term),
+                        .Ack, .TaskComplete, .TitleObserved => {},
                         .Write => try daemon.handleWrite(client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
