@@ -708,7 +708,7 @@ const Daemon = struct {
             std.posix.exit(1);
         }
 
-        const shell = util.detectShell();
+        const shell: [:0]const u8 = if (self.is_task_mode) "/bin/bash" else util.detectShell();
         // Use "-shellname" as argv[0] to signal login shell (traditional method)
         const login_shell = try std.fmt.allocPrintSentinel(
             alloc,
@@ -1229,20 +1229,20 @@ const Daemon = struct {
         }
         const cmd = payload;
 
-        // Daemon appends the task marker so the client never injects
-        // shell-specific syntax, keeping Ctrl-C recovery clean.
+        // Daemon appends the task marker so we know when a task is done with
+        // exit status
         const marker = if (self.is_fish)
-            "; echo ZMX_TASK_COMPLETED:$status"
+            "echo ZMX_TASK_COMPLETED:$status\r"
         else
-            "; echo ZMX_TASK_COMPLETED:$?";
+            "echo ZMX_TASK_COMPLETED:$?\r";
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
             self.queuePtyInput(cmd[0 .. cmd.len - 1]);
         } else {
             self.queuePtyInput(cmd);
         }
-        self.queuePtyInput(marker);
         self.queuePtyInput("\r");
+        self.queuePtyInput(marker);
 
         try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
         client.has_pending_output = true;

@@ -50,6 +50,8 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run", "Run the app");
         const exe = b.addExecutable(.{
             .name = "zmx",
+            .use_llvm = true,
+            .use_lld = true,
             .root_module = exe_mod,
         });
         exe.linkLibC();
@@ -75,6 +77,8 @@ pub fn build(b: *std.Build) void {
         );
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
+            .use_llvm = true,
+            .use_lld = true,
         });
         exe_unit_tests.linkLibC();
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -94,6 +98,8 @@ pub fn build(b: *std.Build) void {
         const check = b.step("check", "Check if zmx compiles");
         const exe_check = b.addExecutable(.{
             .name = "zmx",
+            .use_llvm = true,
+            .use_lld = true,
             .root_module = exe_mod,
         });
         exe_check.linkLibC();
@@ -132,6 +138,8 @@ pub fn build(b: *std.Build) void {
 
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
+                .use_llvm = true,
+                .use_lld = true,
                 .root_module = release_mod,
             });
             release_exe.linkLibC();
