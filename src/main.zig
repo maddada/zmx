@@ -283,6 +283,25 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         return refresh(&cfg, sesh, socket_path);
+    } else if (std.mem.eql(u8, cmd, "refresh-if-stale")) {
+        const session_name = args.next() orelse "";
+        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
+            return help();
+        }
+        if (session_name.len == 0) return error.SessionNameRequired;
+        const rows_arg = args.next() orelse return error.RowsRequired;
+        const cols_arg = args.next() orelse return error.ColsRequired;
+        const rows = try std.fmt.parseInt(u16, rows_arg, 10);
+        const cols = try std.fmt.parseInt(u16, cols_arg, 10);
+        if (rows == 0 or cols == 0) return error.InvalidTerminalSize;
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        return refreshIfStale(&cfg, sesh, socket_path, .{ .rows = rows, .cols = cols });
     } else if (std.mem.eql(u8, cmd, "watch-title")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1009,6 +1028,35 @@ const Daemon = struct {
         requesting_client.has_pending_output = true;
     }
 
+    pub fn handleRefreshIfStale(
+        self: *Daemon,
+        requesting_client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        // CDXC:ZmxPersistence 2026-06-05-21:27: Mac pane clicks should repair sessions resized by another client, such as an iPhone attach, without repainting on every normal terminal click. Compare the caller's current grid to the daemon VT grid; ACK without Output when they already match so clicks do not scroll the terminal to the bottom.
+        if (payload.len != @sizeOf(ipc.Resize)) {
+            try ipc.appendMessage(self.alloc, &requesting_client.write_buf, .Ack, "0");
+            requesting_client.has_pending_output = true;
+            return;
+        }
+
+        const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+        const current_rows: u16 = @intCast(term.screens.active.pages.rows);
+        const current_cols: u16 = @intCast(term.screens.active.pages.cols);
+        const is_stale = resize.rows != current_rows or resize.cols != current_cols;
+        if (is_stale) {
+            try self.applyTerminalResize(pty_fd, term, resize);
+            for (self.clients.items) |client| {
+                if (!client.is_terminal) continue;
+                self.appendVisibleRefresh(client, term);
+            }
+        }
+        try ipc.appendMessage(self.alloc, &requesting_client.write_buf, .Ack, if (is_stale) "1" else "0");
+        requesting_client.has_pending_output = true;
+    }
+
     pub fn handleInit(
         self: *Daemon,
         client: *Client,
@@ -1416,6 +1464,7 @@ fn help() !void {
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  [re]fresh <name>                         Repaint attached terminal clients
+        \\  refresh-if-stale <name> <rows> <cols>    Repaint only when daemon grid differs
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
@@ -2394,6 +2443,62 @@ fn refresh(cfg: *Cfg, session_name: []const u8, socket_path: []const u8) !void {
     return error.NoAckReceived;
 }
 
+fn refreshIfStale(
+    cfg: *Cfg,
+    session_name: []const u8,
+    socket_path: []const u8,
+    resize: ipc.Resize,
+) !void {
+    const alloc = std.heap.c_allocator;
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+
+    var dir = try std.fs.openDirAbsolute(cfg.socket_dir, .{});
+    defer dir.close();
+
+    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(dir, session_name);
+            try w.interface.print("cleaned up stale session {s}\n", .{session_name});
+        } else {
+            try w.interface.print(
+                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
+                .{ session_name, @errorName(err) },
+            );
+        }
+        try w.interface.flush();
+        return;
+    };
+    defer posix.close(probe_result.fd);
+
+    ipc.send(probe_result.fd, .RefreshIfStale, std.mem.asBytes(&resize)) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+
+    var poll_fds = [_]posix.pollfd{.{ .fd = probe_result.fd, .events = posix.POLL.IN, .revents = 0 }};
+    const poll_result = posix.poll(&poll_fds, 1000) catch return error.Timeout;
+    if (poll_result == 0) return error.NoAckReceived;
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const n = sb.read(probe_result.fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .Ack) {
+            const status = if (msg.payload.len > 0 and msg.payload[0] == '1') "applied" else "skipped";
+            try w.interface.print("refresh-if-stale {s}\n", .{status});
+            try w.interface.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
+}
+
 fn watchTitle(_: *Cfg, _: []const u8, socket_path: []const u8) !void {
     const alloc = std.heap.c_allocator;
     const client_sock = try socket.sessionConnect(socket_path);
@@ -2983,6 +3088,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Refresh => try daemon.handleRefresh(client, &term),
+                        .RefreshIfStale => try daemon.handleRefreshIfStale(client, pty_fd, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(client, &term),
                         .Ack, .TaskComplete, .TitleObserved => {},
