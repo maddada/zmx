@@ -7,7 +7,7 @@ pub const max_settle_ms: i64 = 6_000;
 // CDXC:ZmxTitleObservations 2026-06-01-10:17:
 // Agent CLIs often animate terminal titles with spinner glyphs. zmx should observe those titles at the PTY layer, but it must coalesce semantic title changes before notifying gxserver: keep only the latest raw title, emit after 1s of semantic stability, and force a burst closed after 6s.
 // CDXC:ZmxTitleObservations 2026-06-06-07:09:
-// gxserver uses changing title frames inside a 3s activity window to decide whether Codex/Claude/Cursor/Pi sessions are still working. After the first semantic title emission, send changing raw spinner frames at most once every 2s so the working detector stays alive without flooding the sidebar with dozens of no-op title events per second.
+// gxserver uses changing title frames inside a 5s slow-spinner freshness window to decide whether Codex/Claude/Cursor/Pi sessions are still working. After the first semantic title emission, send changing raw spinner frames at most once every 2s so the working detector stays alive without flooding the sidebar with dozens of no-op title events per second.
 pub const Coalescer = struct {
     burst_started_ms: i64 = 0,
     last_changed_ms: i64 = 0,
