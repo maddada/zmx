@@ -22,6 +22,7 @@ pub const Tag = enum(u8) {
     TitleSubscribe = 15,
     TitleObserved = 16,
     RefreshIfStale = 17,
+    PromptEditorCapability = 18,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -264,12 +265,13 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },           .{ Tag.Output, 1 },         .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },          .{ Tag.DetachAll, 4 },      .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },            .{ Tag.Init, 7 },           .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },             .{ Tag.Ack, 10 },           .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },          .{ Tag.TaskComplete, 13 },  .{ Tag.Refresh, 14 },
-        .{ Tag.TitleSubscribe, 15 }, .{ Tag.TitleObserved, 16 }, .{ Tag.RefreshIfStale, 17 },
+        .{ Tag.Input, 0 },                   .{ Tag.Output, 1 },         .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },                  .{ Tag.DetachAll, 4 },      .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },                    .{ Tag.Init, 7 },           .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },                     .{ Tag.Ack, 10 },           .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },                  .{ Tag.TaskComplete, 13 },  .{ Tag.Refresh, 14 },
+        .{ Tag.TitleSubscribe, 15 },         .{ Tag.TitleObserved, 16 }, .{ Tag.RefreshIfStale, 17 },
+        .{ Tag.PromptEditorCapability, 18 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

@@ -37,6 +37,7 @@ var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 // https://github.com/ziglang/zig/blob/738d2be9d6b6ef3ff3559130c05159ef53336224/lib/std/posix.zig#L3505
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 const ghostexRefreshSequence = "\x1b]1337;ZMX_REFRESH\x07";
+const promptEditorCapabilityMonaco: u8 = 1;
 
 const SessionMatch = struct {
     name: []const u8,
@@ -137,20 +138,32 @@ pub fn main() !void {
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         var restore_visible_only = false;
-        var session_name = args.next() orelse "";
-        if (std.mem.eql(u8, session_name, "--visible-only")) {
-            restore_visible_only = true;
-            session_name = args.next() orelse "";
-        }
-        if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
-            return help();
-        }
+        var prompt_editor_capabilities: u8 = 0;
+        var session_name: []const u8 = "";
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                return help();
+            }
             if (std.mem.eql(u8, arg, "--visible-only")) {
                 restore_visible_only = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--prompt-editor=monaco")) {
+                prompt_editor_capabilities |= promptEditorCapabilityMonaco;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--prompt-editor")) {
+                const value = args.next() orelse "";
+                if (std.mem.eql(u8, value, "monaco")) {
+                    prompt_editor_capabilities |= promptEditorCapabilityMonaco;
+                }
+                continue;
+            }
+            if (session_name.len == 0) {
+                session_name = arg;
                 continue;
             }
             try command_args.append(alloc, arg);
@@ -185,7 +198,25 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path=<redacted>", .{});
-        return attach(&daemon, restore_visible_only);
+        return attach(&daemon, restore_visible_only, prompt_editor_capabilities);
+    } else if (std.mem.eql(u8, cmd, "prompt-editor-capability")) {
+        var session_name: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                return help();
+            } else if (session_name == null) {
+                session_name = arg;
+            }
+        }
+        const sesh_env = socket.getSeshNameFromEnv();
+        const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
+        defer alloc.free(sesh);
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer alloc.free(socket_path);
+        return printPromptEditorCapability(&cfg, sesh, socket_path);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -514,6 +545,7 @@ const Client = struct {
     has_pending_output: bool = false,
     is_terminal: bool = false,
     is_title_watcher: bool = false,
+    prompt_editor_capabilities: u8 = 0,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -974,6 +1006,28 @@ const Daemon = struct {
         }
     }
 
+    pub fn handlePromptEditorCapability(self: *Daemon, client: *Client) !void {
+        // CDXC:PromptEditor 2026-06-06-16:40:
+        // Ctrl+G prompt-editor routing must use the current zmx attach client,
+        // not stale shell environment inherited when the long-lived session was
+        // created. Only a leader client that explicitly advertised Monaco support
+        // may open the floating editor; every missing or non-advertised client
+        // returns gte so TUI, mobile, and plain SSH attaches stay terminal-native.
+        var capability: []const u8 = "gte";
+        if (self.leader_client_fd) |leader_fd| {
+            for (self.clients.items) |existing_client| {
+                if (existing_client.socket_fd == leader_fd and
+                    existing_client.prompt_editor_capabilities & promptEditorCapabilityMonaco != 0)
+                {
+                    capability = "monaco";
+                    break;
+                }
+            }
+        }
+        try ipc.appendMessage(self.alloc, &client.write_buf, .PromptEditorCapability, capability);
+        client.has_pending_output = true;
+    }
+
     pub fn handleSwitch(self: *Daemon, session_name: []const u8) !void {
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
@@ -1067,6 +1121,10 @@ const Daemon = struct {
         if (payload.len < @sizeOf(ipc.Resize)) return;
         client.is_terminal = true;
         const restore_visible_only = payload.len > @sizeOf(ipc.Resize) and payload[@sizeOf(ipc.Resize)] == 1;
+        client.prompt_editor_capabilities = if (payload.len > @sizeOf(ipc.Resize) + 1)
+            payload[@sizeOf(ipc.Resize) + 1]
+        else
+            0;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
         // no leader is set so set one
@@ -1459,7 +1517,8 @@ fn help() !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach [--visible-only] <name> [command...]  Attach to session, creating if needed
+        \\  [a]ttach [--visible-only] [--prompt-editor=monaco] <name> [command...]  Attach to session, creating if needed
+        \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
@@ -2117,7 +2176,7 @@ fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !voi
     }
 }
 
-fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
+fn switchSesh(daemon: *Daemon, current_sesh: []const u8, prompt_editor_capabilities: u8) !void {
     // we want daemon.session_name because that's the session name the user provided during zmx attach
     // instead of the name of the session they are currently inside of.
     const next_session = daemon.session_name;
@@ -2146,16 +2205,17 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     };
     defer posix.close(fd);
 
+    _ = prompt_editor_capabilities;
     ipc.send(fd, .Switch, next_session) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
 }
 
-fn attach(daemon: *Daemon, restore_visible_only: bool) !void {
+fn attach(daemon: *Daemon, restore_visible_only: bool, prompt_editor_capabilities: u8) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
-        return switchSesh(daemon, sesh);
+        return switchSesh(daemon, sesh, prompt_editor_capabilities);
     }
 
     const result = try daemon.ensureSession();
@@ -2209,7 +2269,7 @@ fn attach(daemon: *Daemon, restore_visible_only: bool) !void {
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try clientLoop(client_sock, restore_visible_only);
+    const looper = try clientLoop(client_sock, restore_visible_only, prompt_editor_capabilities);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2241,7 +2301,7 @@ fn attach(daemon: *Daemon, restore_visible_only: bool) !void {
                     .created_at = @intCast(std.time.timestamp()),
                     .leader_client_fd = null,
                 };
-                return attach(&target_daemon, restore_visible_only);
+                return attach(&target_daemon, restore_visible_only, prompt_editor_capabilities);
             }
         },
     }
@@ -2499,6 +2559,38 @@ fn refreshIfStale(
     return error.NoAckReceived;
 }
 
+fn printPromptEditorCapability(_: *Cfg, _: []const u8, socket_path: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    const fd = try socket.sessionConnect(socket_path);
+    defer posix.close(fd);
+
+    try ipc.send(fd, .PromptEditorCapability, "");
+
+    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const poll_result = posix.poll(&poll_fds, 500) catch return error.Timeout;
+    if (poll_result == 0) return error.Timeout;
+
+    var sb = try ipc.SocketBuffer.init(alloc);
+    defer sb.deinit();
+
+    const n = sb.read(fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
+
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .PromptEditorCapability) {
+            try stdout.print("{s}\n", .{msg.payload});
+            try stdout.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
+}
+
 fn watchTitle(_: *Cfg, _: []const u8, socket_path: []const u8) !void {
     const alloc = std.heap.c_allocator;
     const client_sock = try socket.sessionConnect(socket_path);
@@ -2676,7 +2768,7 @@ test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32, restore_visible_only: bool) !ClientResult {
+fn clientLoop(client_sock_fd: i32, restore_visible_only: bool, prompt_editor_capabilities: u8) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2695,9 +2787,11 @@ fn clientLoop(client_sock_fd: i32, restore_visible_only: bool) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    var init_payload: [@sizeOf(ipc.Resize) + 1]u8 = undefined;
+    // CDXC:PromptEditor 2026-06-06-16:40: zmx attach clients advertise Monaco prompt-editor support explicitly; omitted capability bytes mean gte so inherited shell environment cannot make SSH, mobile, or TUI clients open a host-only popup.
+    var init_payload: [@sizeOf(ipc.Resize) + 2]u8 = undefined;
     @memcpy(init_payload[0..@sizeOf(ipc.Resize)], std.mem.asBytes(&size));
     init_payload[@sizeOf(ipc.Resize)] = if (restore_visible_only) 1 else 0;
+    init_payload[@sizeOf(ipc.Resize) + 1] = prompt_editor_capabilities;
     try ipc.appendMessage(alloc, &sock_write_buf, .Init, &init_payload);
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
@@ -3089,6 +3183,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Refresh => try daemon.handleRefresh(client, &term),
                         .RefreshIfStale => try daemon.handleRefreshIfStale(client, pty_fd, &term, msg.payload),
+                        .PromptEditorCapability => try daemon.handlePromptEditorCapability(client),
                         .Run => try daemon.handleRun(client, msg.payload),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(client, &term),
                         .Ack, .TaskComplete, .TitleObserved => {},
