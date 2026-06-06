@@ -1,18 +1,23 @@
 const std = @import("std");
 
 pub const debounce_ms: i64 = 1_000;
+pub const semantic_heartbeat_ms: i64 = 2_000;
 pub const max_settle_ms: i64 = 6_000;
 
 // CDXC:ZmxTitleObservations 2026-06-01-10:17:
 // Agent CLIs often animate terminal titles with spinner glyphs. zmx should observe those titles at the PTY layer, but it must coalesce semantic title changes before notifying gxserver: keep only the latest raw title, emit after 1s of semantic stability, and force a burst closed after 6s.
+// CDXC:ZmxTitleObservations 2026-06-06-07:09:
+// gxserver uses changing title frames inside a 3s activity window to decide whether Codex/Claude/Cursor/Pi sessions are still working. After the first semantic title emission, send changing raw spinner frames at most once every 2s so the working detector stays alive without flooding the sidebar with dozens of no-op title events per second.
 pub const Coalescer = struct {
     burst_started_ms: i64 = 0,
     last_changed_ms: i64 = 0,
+    last_emitted_ms: i64 = 0,
     latest_signature: ?[]u8 = null,
     latest_title: ?[]u8 = null,
     last_emitted_signature: ?[]u8 = null,
     last_emitted_title: ?[]u8 = null,
     pending: bool = false,
+    pending_heartbeat: bool = false,
 
     pub fn deinit(self: *Coalescer, alloc: std.mem.Allocator) void {
         if (self.latest_signature) |value| alloc.free(value);
@@ -37,6 +42,7 @@ pub const Coalescer = struct {
         if (self.latest_signature) |latest| {
             if (std.mem.eql(u8, latest, signature)) {
                 try self.replaceLatestTitle(alloc, trimmed);
+                self.scheduleSemanticHeartbeatIfNeeded();
                 alloc.free(signature);
                 return;
             }
@@ -45,6 +51,7 @@ pub const Coalescer = struct {
             if (self.last_emitted_signature) |last_emitted| {
                 if (std.mem.eql(u8, last_emitted, signature)) {
                     try self.replaceLatestTitle(alloc, trimmed);
+                    self.scheduleSemanticHeartbeatIfNeeded();
                     alloc.free(signature);
                     return;
                 }
@@ -53,18 +60,18 @@ pub const Coalescer = struct {
         }
         self.last_changed_ms = now_ms;
         self.pending = true;
+        self.pending_heartbeat = false;
         if (self.latest_signature) |value| alloc.free(value);
         self.latest_signature = signature;
         try self.replaceLatestTitle(alloc, trimmed);
     }
 
     pub fn pollTimeoutMs(self: *const Coalescer, now_ms: i64) i32 {
-        if (!self.pending) {
-            return -1;
-        }
-        const debounce_due_ms = self.last_changed_ms + debounce_ms;
-        const max_due_ms = self.burst_started_ms + max_settle_ms;
-        const due_ms = @min(debounce_due_ms, max_due_ms);
+        const due_ms = if (self.pending) blk: {
+            const debounce_due_ms = self.last_changed_ms + debounce_ms;
+            const max_due_ms = self.burst_started_ms + max_settle_ms;
+            break :blk @min(debounce_due_ms, max_due_ms);
+        } else if (self.pending_heartbeat) self.last_emitted_ms + semantic_heartbeat_ms else return -1;
         if (due_ms <= now_ms) {
             return 0;
         }
@@ -73,37 +80,74 @@ pub const Coalescer = struct {
     }
 
     pub fn takeDue(self: *Coalescer, alloc: std.mem.Allocator, now_ms: i64) !?[]u8 {
-        if (!self.isDue(now_ms)) {
-            return null;
+        if (self.isPendingDue(now_ms)) {
+            self.pending = false;
+            return try self.emitLatest(alloc, now_ms, false);
         }
-        self.pending = false;
-        const title = self.latest_title orelse return null;
-        const signature = self.latest_signature orelse return null;
-        if (self.last_emitted_signature) |last_emitted| {
-            if (std.mem.eql(u8, last_emitted, signature)) {
-                return null;
-            }
+        if (self.isHeartbeatDue(now_ms)) {
+            self.pending_heartbeat = false;
+            return try self.emitLatest(alloc, now_ms, true);
         }
-        if (self.last_emitted_signature) |value| alloc.free(value);
-        self.last_emitted_signature = try alloc.dupe(u8, signature);
-        if (self.last_emitted_title) |value| alloc.free(value);
-        self.last_emitted_title = try alloc.dupe(u8, title);
-        return try alloc.dupe(u8, title);
+        return null;
     }
 
     pub fn lastEmittedTitle(self: *const Coalescer) ?[]const u8 {
         return self.last_emitted_title;
     }
 
-    fn isDue(self: *const Coalescer, now_ms: i64) bool {
+    fn emitLatest(self: *Coalescer, alloc: std.mem.Allocator, now_ms: i64, allow_repeated_signature: bool) !?[]u8 {
+        const title = self.latest_title orelse return null;
+        const signature = self.latest_signature orelse return null;
+        if (self.last_emitted_signature) |last_emitted| {
+            if (std.mem.eql(u8, last_emitted, signature)) {
+                if (!allow_repeated_signature) {
+                    return null;
+                }
+                if (self.last_emitted_title) |last_title| {
+                    if (std.mem.eql(u8, last_title, title)) {
+                        return null;
+                    }
+                }
+            }
+        }
+        if (self.last_emitted_signature) |value| alloc.free(value);
+        self.last_emitted_signature = try alloc.dupe(u8, signature);
+        if (self.last_emitted_title) |value| alloc.free(value);
+        self.last_emitted_title = try alloc.dupe(u8, title);
+        self.last_emitted_ms = now_ms;
+        return try alloc.dupe(u8, title);
+    }
+
+    fn isPendingDue(self: *const Coalescer, now_ms: i64) bool {
         return self.pending and
             (now_ms - self.last_changed_ms >= debounce_ms or
                 now_ms - self.burst_started_ms >= max_settle_ms);
     }
 
+    fn isHeartbeatDue(self: *const Coalescer, now_ms: i64) bool {
+        return self.pending_heartbeat and now_ms - self.last_emitted_ms >= semantic_heartbeat_ms;
+    }
+
     fn replaceLatestTitle(self: *Coalescer, alloc: std.mem.Allocator, title: []const u8) !void {
         if (self.latest_title) |value| alloc.free(value);
         self.latest_title = try alloc.dupe(u8, title);
+    }
+
+    fn scheduleSemanticHeartbeatIfNeeded(self: *Coalescer) void {
+        if (self.pending) {
+            return;
+        }
+        const latest_signature = self.latest_signature orelse return;
+        const last_emitted_signature = self.last_emitted_signature orelse return;
+        if (!std.mem.eql(u8, latest_signature, last_emitted_signature)) {
+            return;
+        }
+        const latest_title = self.latest_title orelse return;
+        const last_emitted_title = self.last_emitted_title orelse return;
+        if (std.mem.eql(u8, latest_title, last_emitted_title)) {
+            return;
+        }
+        self.pending_heartbeat = true;
     }
 };
 
@@ -351,7 +395,45 @@ test "coalescer suppresses repeated semantic frames after first emission" {
     try std.testing.expectEqualStrings("[·] Action Required 12s", coalescer.lastEmittedTitle().?);
 
     try coalescer.observe(alloc, "[!] Action Required 13s", 1_500);
-    const repeated = try coalescer.takeDue(alloc, max_settle_ms + 2_000);
+    const repeated = try coalescer.takeDue(alloc, 1_999);
+    try std.testing.expect(repeated == null);
+}
+
+test "coalescer heartbeats changing semantic spinner frames inside gxserver working window" {
+    const alloc = std.testing.allocator;
+    var coalescer = Coalescer{};
+    defer coalescer.deinit(alloc);
+
+    try coalescer.observe(alloc, "⠋ Codex Working", 0);
+    const emitted = try coalescer.takeDue(alloc, debounce_ms);
+    try std.testing.expect(emitted != null);
+    alloc.free(emitted.?);
+    try std.testing.expectEqualStrings("⠋ Codex Working", coalescer.lastEmittedTitle().?);
+
+    try coalescer.observe(alloc, "⠙ Codex Working", 1_100);
+    try std.testing.expectEqual(@as(i32, 1_900), coalescer.pollTimeoutMs(1_100));
+    const early = try coalescer.takeDue(alloc, semantic_heartbeat_ms + debounce_ms - 1);
+    try std.testing.expect(early == null);
+
+    const heartbeat = try coalescer.takeDue(alloc, semantic_heartbeat_ms + debounce_ms);
+    try std.testing.expect(heartbeat != null);
+    defer alloc.free(heartbeat.?);
+    try std.testing.expectEqualStrings("⠙ Codex Working", heartbeat.?);
+}
+
+test "coalescer does not heartbeat unchanged raw title" {
+    const alloc = std.testing.allocator;
+    var coalescer = Coalescer{};
+    defer coalescer.deinit(alloc);
+
+    try coalescer.observe(alloc, "⠋ Codex Working", 0);
+    const emitted = try coalescer.takeDue(alloc, debounce_ms);
+    try std.testing.expect(emitted != null);
+    alloc.free(emitted.?);
+
+    try coalescer.observe(alloc, "⠋ Codex Working", 1_100);
+    try std.testing.expectEqual(@as(i32, -1), coalescer.pollTimeoutMs(max_settle_ms));
+    const repeated = try coalescer.takeDue(alloc, max_settle_ms);
     try std.testing.expect(repeated == null);
 }
 
