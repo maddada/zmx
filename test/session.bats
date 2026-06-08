@@ -39,6 +39,20 @@ load test_helper
   [[ "$output" != *"created"* ]]
 }
 
+@test "run: initial-command creates provider without typing argv into shell" {
+  run "$ZMX" run t-init -d --initial-command /bin/zsh -lic 'printf "initial-command-marker\n"; exec /bin/zsh -li'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"session \"t-init\" created"* ]]
+
+  wait_for_session t-init
+  sleep 0.3
+  run "$ZMX" history t-init
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"initial-command-marker"* ]]
+  [[ "$output" != *"--initial-command"* ]]
+  [[ "$output" != *"/bin/zsh -lic"* ]]
+}
+
 @test "run: blocking returns after command completes" {
   run timeout 5 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
   [ "$status" -eq 0 ]

@@ -226,9 +226,16 @@ pub fn main() !void {
         var cmd_args_raw: std.ArrayList([]const u8) = .empty;
         defer cmd_args_raw.deinit(alloc);
         var detached = false;
+        var initial_command = false;
         while (args.next()) |arg| {
             if (std.mem.startsWith(u8, arg, "-d")) {
                 detached = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--initial-command")) {
+                // CDXC:ZmxProviderStartup 2026-06-08-21:18:
+                // Ghostex restore must create missing zmx providers with an initial argv instead of sending large restore scripts through shell input. The flag is intentionally no-op for existing sessions so stale probes cannot replay startup text into a live terminal.
+                initial_command = true;
                 continue;
             }
             try cmd_args_raw.append(alloc, arg);
@@ -248,10 +255,10 @@ pub fn main() !void {
             .session_name = sesh,
             .socket_path = undefined,
             .pid = undefined,
-            .command = null,
+            .command = if (initial_command and cmd_args_raw.items.len > 0) cmd_args_raw.items else null,
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
-            .is_task_mode = true,
+            .is_task_mode = !initial_command,
             .leader_client_fd = null,
         };
         daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
@@ -259,7 +266,7 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path=<redacted>", .{});
-        return run(&daemon, detached, cmd_args_raw.items);
+        return run(&daemon, detached, cmd_args_raw.items, initial_command);
     } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -1566,9 +1573,13 @@ fn help() !void {
         \\
         \\  `-d` will detach from the calling terminal. Use `wait` to track
         \\  its status.
+        \\  `--initial-command` creates a missing session by execing argv as
+        \\  the initial process instead of sending command text through the PTY.
+        \\  Existing sessions ignore the initial command.
         \\
         \\  Examples:
         \\    zmx run dev ls
+        \\    zmx run dev -d --initial-command /bin/zsh -lic 'echo ready; exec /bin/zsh -li'
         \\    zmx run dev zig build
         \\    zmx run dev grep -r TODO src
         \\    zmx run dev git -c core.pager=cat diff
@@ -2622,7 +2633,7 @@ fn watchTitle(_: *Cfg, _: []const u8, socket_path: []const u8) !void {
     }
 }
 
-fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
+fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8, initial_command: bool) !void {
     const alloc = daemon.alloc;
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -2637,6 +2648,17 @@ fn run(daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
     if (result.created) {
         try w.interface.print("session \"{s}\" created\n", .{daemon.session_name});
         try w.interface.flush();
+    }
+
+    if (initial_command) {
+        if (command_args.len == 0) {
+            return error.CommandRequired;
+        }
+        if (!result.created) {
+            try w.interface.print("session \"{s}\" exists; initial command ignored\n", .{daemon.session_name});
+            try w.interface.flush();
+        }
+        return;
     }
 
     if (command_args.len > 0) {

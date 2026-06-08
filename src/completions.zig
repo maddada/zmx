@@ -156,6 +156,7 @@ const fish_completions =
     \\
     \\# Subcommand flags
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -s d -d 'Detach from the calling terminal; use `wait` to track its status'
+    \\complete -c zmx -n "__fish_seen_subcommand_from r run" -l initial-command -d 'Create a missing session by execing argv instead of sending command text through the PTY'
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -l fish -d 'Required when the session runs fish shell'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
     \\complete -c zmx -n "__fish_seen_subcommand_from k kill" -l force -d 'Force kill'
