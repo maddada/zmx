@@ -1019,8 +1019,12 @@ const Daemon = struct {
         // not stale shell environment inherited when the long-lived session was
         // created. Only a leader client that explicitly advertised Monaco support
         // may open the floating editor; every missing or non-advertised client
-        // returns gte so TUI, mobile, and plain SSH attaches stay terminal-native.
-        var capability: []const u8 = "gte";
+        // returns editor so TUI, mobile, and plain SSH attaches stay on the
+        // machine editor.
+        // CDXC:PromptEditorBackend 2026-06-30-03:11: Non-Monaco zmx clients
+        // advertise "editor" instead of the old gte sentinel because Ctrl+G
+        // fallback now runs the machine's EDITOR/VISUAL command.
+        var capability: []const u8 = "editor";
         if (self.leader_client_fd) |leader_fd| {
             for (self.clients.items) |existing_client| {
                 if (existing_client.socket_fd == leader_fd and
@@ -2809,7 +2813,7 @@ fn clientLoop(client_sock_fd: i32, restore_visible_only: bool, prompt_editor_cap
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    // CDXC:PromptEditor 2026-06-06-16:40: zmx attach clients advertise Monaco prompt-editor support explicitly; omitted capability bytes mean gte so inherited shell environment cannot make SSH, mobile, or TUI clients open a host-only popup.
+    // CDXC:PromptEditor 2026-06-06-16:40: zmx attach clients advertise Monaco prompt-editor support explicitly; omitted capability bytes mean the machine editor so inherited shell environment cannot make SSH, mobile, or TUI clients open a host-only popup.
     var init_payload: [@sizeOf(ipc.Resize) + 2]u8 = undefined;
     @memcpy(init_payload[0..@sizeOf(ipc.Resize)], std.mem.asBytes(&size));
     init_payload[@sizeOf(ipc.Resize)] = if (restore_visible_only) 1 else 0;
