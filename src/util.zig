@@ -466,8 +466,10 @@ pub fn isUserInput(payload: []const u8) bool {
                     if (csi.final == 'I' or csi.final == 'O') return false;
                 },
                 .execute => |code| {
-                    // looking for CR, LF, tab, and backspace
-                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) return true;
+                    // CR, LF, tab, backspace, and Ctrl+G/BEL are user input.
+                    // Ctrl+G opens the prompt editor, so the pressing client
+                    // must become leader before prompt-editor-capability runs.
+                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08 or code == 0x07) return true;
                 },
                 else => {},
             }
