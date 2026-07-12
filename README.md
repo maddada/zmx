@@ -4,7 +4,7 @@
   <br>zmx
 </h1>
 <p align="center">
-  Session persistence for terminal processes.
+  Session attach/detach for the terminal.
   <br />
   <a href="https://zmx.sh">Docs</a>
   ·
@@ -16,7 +16,7 @@
 ## features
 
 - Persist terminal shell sessions
-- Ability to attach and detach from a shell session without killing it
+- Ability to attach and detach from a shell session without it being killed
 - Native terminal scrollback
 - Multiple clients can connect to the same session
 - Re-attaching to a session restores previous terminal state and output
@@ -71,9 +71,9 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 > [!IMPORTANT]
 > We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`.
 
-```
-zmx - session persistence for terminal processes
+Run `zmx help` for more information on usage, with examples.
 
+```
 Usage: zmx <command> [args...]
 
 Commands:
@@ -88,103 +88,9 @@ Commands:
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
   [t]ail <name>...                         Follow session output
-  [c]ompletions <shell>                    Shell completions (bash, zsh, fish)
-  [v]ersion                                Show version
+  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
+  [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
-
-Attach:
-  This will spawn a login $SHELL with a PTY.  You can provide a
-  command instead of creating a shell.
-
-  Examples:
-    zmx attach dev
-    zmx attach dev vim
-
-History:
-  This should generally be used with `tail` to print the last lines
-  of the session's scrollback history.
-
-  Examples:
-    zmx history <session> | tail -100
-
-Run:
-  Commands are passed as-is: do not wrap in quotes.
-  Commands run sequentially: do not send multiple in parallel.
-  Avoid interactive programs (pagers, editors, prompts): they hang.
-
-  `--fish` is required when the session runs fish shell.
-
-  If the command hangs, send Ctrl+C to recover:
-    zmx run <session> $(printf '\x03')
-
-  If the command hangs, print the history to see the error:
-    zmx history <session> | tail -100
-
-  `-d` will detach from the calling terminal. Use `wait` to track
-  its status.
-
-  Examples:
-    zmx run dev ls
-    zmx run dev --fish ls src
-    zmx run dev zig build
-    zmx run dev grep -r TODO src
-    zmx run dev git -c core.pager=cat diff
-
-Send:
-  Sends raw text to the session's PTY input (fire-and-forget).
-  Unlike `run`, no completion marker is appended and no exit code
-  is tracked.  Useful for TUI applications, interactive prompts,
-  or any program that reads stdin directly.
-
-  Text is sent byte-for-byte with no automatic carriage return.
-  Append \r yourself when you want the shell to execute a command.
-
-  Text can also be piped via stdin:
-    printf 'ls -la\r' | zmx send dev
-
-  Examples:
-    printf 'echo hello\r' | zmx send dev
-    zmx send dev $(printf '\x03')
-    zmx send dev /compact
-
-Print:
-  Injects text directly into the session display and scrollback.
-  Never touches the PTY input -- the shell sees nothing.
-  Caller is responsible for newlines (\\r\\n).
-
-  Examples:
-    printf '\\r\\nhello\\r\\n' | zmx print dev
-    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
-
-Write:
-  Writes stdin to file_path inside the session. Works over SSH.
-  file_path can be absolute or relative to the session shell's cwd.
-  Requires base64 and printf in the remote environment.
-  Large files are chunked automatically (~48KB per chunk).
-  File path must not contain single quotes.
-
-  Examples:
-    echo "hello" | zmx write dev /tmp/hello.txt
-    cat main.zig | zmx write dev src/main.zig
-
-Wait:
-  Used with a detached run task to track its status.  Multiple
-  sessions can be provided.
-
-  Examples:
-    zmx run -d dev sleep 10
-    zmx wait dev
-    zmx wait dev other
-
-Environment variables:
-  SHELL                Default shell for new sessions
-  ZMX_DIR              Socket directory (priority 1)
-  XDG_RUNTIME_DIR      Socket directory (priority 2)
-  TMPDIR               Socket directory (priority 3)
-  ZMX_SESSION          Session name (injected automatically)
-  ZMX_SESSION_PREFIX   Prefix added to all session names
-  ZMX_DIR_MODE         Sets mode for socket and log directories (octal, defaults to 0750)
-  ZMX_LOG_MODE         Sets mode for log files (octal, defaults to 0640)
 ```
 
 ## shell prompt
@@ -320,10 +226,10 @@ Requires [fzf](https://github.com/junegunn/fzf).
 zmx-select() {
   local display
   display=$(zmx list 2>/dev/null | while IFS=$'\t' read -r name pid clients created dir; do
-    name=${name#session_name=}
-    pid=${pid#pid=}
-    clients=${clients#clients=}
-    dir=${dir#started_in=}
+    name=${name#*name=}
+    pid=${pid#*pid=}
+    clients=${clients#*clients=}
+    dir=${dir#*start_dir=}
     printf "%-20s  pid:%-8s  clients:%-2s  %s\n" "$name" "$pid" "$clients" "$dir"
   done)
 
@@ -387,6 +293,19 @@ The entire argument for `zmx` instead of something like `tmux` that has windows,
 Instead, this tool specifically focuses on session persistence and defers window management to your os wm.
 
 ## ssh workflow
+
+### Try it out quickly
+If you'd like to try out `zmx` and `ssh` without fiddling your `ssh` config, make sure to pass the `-t` option to `ssh`.  Here's an example:
+
+```bash
+ssh -t dev-box zmx attach default
+```
+
+Without `-t`, the remote shell will not know it's talking to a terminal, and the display will likely get messed up.
+
+This option isn't needed if you follow the configuration steps below, because `RequestTTY yes` does the same thing.
+
+### Configure it for regular use
 
 Using `zmx` with `ssh` is a first-class citizen. Instead of using `ssh` to remote into your system with a single terminal and `n` tmux panes, you open `n` terminals and run `ssh` for all of them. This might sound tedious, but there are tools to make this a delightful workflow.
 
@@ -461,10 +380,6 @@ This is particularly useful when running `zmx` as a system service with a shared
 
 We store global logs for cli commands in `{socket_dir}/logs/zmx.log`. We store session-specific logs in `{socket_dir}/logs/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
 
-## a note on configuration
-
-We are evaluating what should be configurable and what should not. Every configuration option is a burden for us maintainers. For example, being able to change the default detach shortcut is difficult in a terminal environment.
-
 ## a smol contract
 
 - Write programs that solve a well defined problem.
@@ -478,13 +393,14 @@ We are evaluating what should be configurable and what should not. Every configu
 - When upgrading versions of `zmx` where we make changes to the underlying IPC communication, it will kill all your sessions because it cannot communicate through the daemon socket properly
 - Terminal state restoration with nested `zmx` sessions through SSH: host A `zmx` -> SSH -> host B `zmx`
   - Specifically cursor position gets corrupted
+  - Essentially this is unspecified and unsupported behavior
 - When re-attaching and kitty keyboard mode was previously enable, we try to re-send that CSI query to re-enable it
   - Some programs don't know how to handle that CSI query (e.g. `psql`) so when you type it echos kitty escape sequences erroneously
 
 ## impl
 
 - The `daemon` and client processes communicate via a unix socket
-- Both `daemon` and `client` loops leverage `poll()`
+- Both `daemon` and `client` loops leverage `poll(2)`
 - Each session creates its own unix socket file
 - We restore terminal state and output using `libghostty-vt`
 
@@ -537,6 +453,7 @@ abduco provides session management (i.e. it allows programs to be run independen
 
 ## community tools
 
+- [emacs-term-sessions](https://github.com/ArthurHeymans/emacs-term-sessions) Persistent terminal sessions in Emacs, both local and remote.
 - [pi-zmx](https://github.com/deevus/pi-zmx) -- [pi](https://pi.dev) extension for zmx.
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).

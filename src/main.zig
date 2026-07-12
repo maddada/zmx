@@ -784,7 +784,7 @@ const Daemon = struct {
             std.posix.exit(1);
         }
 
-        const shell: [:0]const u8 = if (self.is_task_mode) "/bin/bash" else util.detectShell();
+        const shell: [:0]const u8 = if (self.is_task_mode) "bash" else util.detectShell();
         // Use "-shellname" as argv[0] to signal login shell (traditional method)
         const login_shell = try std.fmt.allocPrintSentinel(
             alloc,
@@ -793,8 +793,8 @@ const Daemon = struct {
             0,
         );
         const argv = [_:null]?[*:0]const u8{ login_shell, null };
-        const err = std.posix.execveZ(shell, &argv, std.c.environ);
-        std.log.err("execve failed: err={s}", .{@errorName(err)});
+        const err = std.posix.execvpeZ(shell, &argv, std.c.environ);
+        std.log.err("execvpe failed: shell={s} err={s}", .{ shell, @errorName(err) });
         std.posix.exit(1);
     }
 
@@ -804,8 +804,8 @@ const Daemon = struct {
         var ws: cross.c.struct_winsize = .{
             .ws_row = size.rows,
             .ws_col = size.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .ws_xpixel = size.xpixel,
+            .ws_ypixel = size.ypixel,
         };
 
         var master_fd: c_int = undefined;
@@ -1212,8 +1212,8 @@ const Daemon = struct {
         var ws: cross.c.struct_winsize = .{
             .ws_row = resize.rows,
             .ws_col = resize.cols,
-            .ws_xpixel = 0,
-            .ws_ypixel = 0,
+            .ws_xpixel = resize.xpixel,
+            .ws_ypixel = resize.ypixel,
         };
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
         // Disable prompt_redraw before resize. The daemon's internal terminal
@@ -1414,20 +1414,27 @@ const Daemon = struct {
         }
         const cmd = payload;
 
-        // Daemon appends the task marker so we know when a task is done with
-        // exit status
-        const marker = if (self.is_fish)
-            "echo ZMX_TASK_COMPLETED:$status\r"
+        // Chain the exit marker with `;` on the same line. `$?` captures the
+        // exit code of the command (not the `;`). The sole exception is when
+        // the command contains a heredoc (`<<`), the delimiter must be alone
+        // on its line, so the marker goes on the next line instead.
+        // Fish exposes the last exit code as $status instead of $?.
+        const single_line_marker = if (self.is_fish)
+            "; echo ZMX_TASK_COMPLETED:$status\r"
         else
-            "echo ZMX_TASK_COMPLETED:$?\r";
+            "; echo ZMX_TASK_COMPLETED:$?\r";
+        const heredoc_marker = if (self.is_fish)
+            "\r\necho ZMX_TASK_COMPLETED:$status\r"
+        else
+            "\r\necho ZMX_TASK_COMPLETED:$?\r";
+        const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
             self.queuePtyInput(cmd[0 .. cmd.len - 1]);
         } else {
             self.queuePtyInput(cmd);
         }
-        self.queuePtyInput("\r");
-        self.queuePtyInput(marker);
+        self.queuePtyInput(if (uses_heredoc) heredoc_marker else single_line_marker);
 
         try ipc.appendMessage(self.alloc, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
@@ -1543,8 +1550,8 @@ fn help() !void {
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
         \\  watch-title <name>                       Stream coalesced terminal title observations as JSON lines
-        \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish)
-        \\  [v]ersion                                Show version
+        \\  [c]ompletions <shell>                    Shell completions (bash, zsh, fish, nu)
+        \\  [v]ersion                                Show version and metadata (socket dir, log dir)
         \\  [h]elp                                   Show this help
         \\
         \\Attach:
@@ -1565,15 +1572,13 @@ fn help() !void {
         \\    zmx history <session> | tail -100
         \\
         \\Run:
+        \\  Commands run inside a PTY using bash
         \\  Commands are passed as-is: do not wrap in quotes.
         \\  Commands run sequentially: do not send multiple in parallel.
-        \\  Avoid interactive programs (pagers, editors, prompts): they hang.
-        \\
-        \\  If the command hangs, send Ctrl+C to recover:
-        \\    zmx run <session> $(printf '\x03')
-        \\
-        \\  If the command hangs, print the history to see the error:
-        \\    zmx history <session> | tail -100
+        \\  Stdin is redirected from /dev/null to prevent interactive programs
+        \\  (pagers, editors, prompts) from blocking. Use `zmx send` for
+        \\  commands that need user input, or pipe data directly:
+        \\    echo "data" | zmx run dev cat
         \\
         \\  `-d` will detach from the calling terminal. Use `wait` to track
         \\  its status.
@@ -1586,7 +1591,15 @@ fn help() !void {
         \\    zmx run dev -d --initial-command /bin/zsh -lic 'echo ready; exec /bin/zsh -li'
         \\    zmx run dev zig build
         \\    zmx run dev grep -r TODO src
-        \\    zmx run dev git -c core.pager=cat diff
+        \\    zmx run dev git log --oneline          # pager won't block
+        \\    echo "hello" | zmx run dev cat         # piped stdin still works
+        \\
+        \\    # heredoc
+        \\    printf "cat << 'EOF'\r\nHello $USER\r\nToday is $(date).\r\nEOF" | zmx run dev
+        \\
+        \\    # non-blocking
+        \\    zmx run dev -d sleep 10
+        \\    zmx wait dev
         \\
         \\Send:
         \\  Sends raw text to the session's PTY input (fire-and-forget).
@@ -1727,17 +1740,30 @@ fn tail(client_socket_fds: std.ArrayList(i32), detached: bool, is_run_cmd: bool)
                         },
                         .Output => {
                             if (msg.payload.len > 0) {
-                                // strip the first line since it is an echo of
-                                // the command.
+                                // Strip the first line (command echo) for run mode.
+                                var payload = msg.payload;
                                 if (!detached and is_run_cmd and is_first_line) {
-                                    if (std.mem.indexOfScalar(u8, msg.payload, '\n')) |nl| {
+                                    if (std.mem.indexOfScalar(u8, payload, '\n')) |nl| {
                                         is_first_line = false;
-                                        if (nl + 1 < msg.payload.len) {
-                                            try stdout_buf.appendSlice(alloc, msg.payload[nl + 1 ..]);
-                                        }
+                                        payload = payload[nl + 1 ..];
+                                    } else {
+                                        is_first_line = false;
+                                        payload = payload[payload.len..]; // consume entire echo line
                                     }
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, msg.payload);
+                                }
+
+                                if (payload.len > 0) {
+                                    // Strip ANSI escape sequences to produce plain text.
+                                    // This prevents shell prompts, colors, cursor movements,
+                                    // and other VT sequences from corrupting the caller's terminal.
+                                    const plain = util.stripAnsi(alloc, payload) catch |err| {
+                                        std.log.warn("stripAnsi failed: {s}", .{@errorName(err)});
+                                        continue;
+                                    };
+                                    defer alloc.free(plain);
+                                    if (plain.len > 0) {
+                                        try stdout_buf.appendSlice(alloc, plain);
+                                    }
                                 }
                             }
                         },
@@ -3055,7 +3081,11 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 .read_buf = try ipc.SocketBuffer.init(daemon.alloc),
                 .write_buf = undefined,
             };
-            client.write_buf = try std.ArrayList(u8).initCapacity(client.alloc, 4096);
+            // 64KB initial capacity lets ~15 broadcast cycles (N_TTY_BUF_SIZE reads
+            // * header) accumulate before the first ArrayList growth. The write
+            // buffer is userspace-only: it drains via POLLOUT to the client socket,
+            // which has no corresponding kernel-imposed per-write limit.
+            client.write_buf = try std.ArrayList(u8).initCapacity(client.alloc, 65536);
             try daemon.clients.append(daemon.alloc, client);
             std.log.info(
                 "client connected fd={d} total={d}",
@@ -3065,7 +3095,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
         const inp_flags = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
         if (poll_fds.items[1].revents & inp_flags != 0) {
-            // Read from PTY
+            // Read from PTY. Buffer is sized to N_TTY_BUF_SIZE (4096): the hard
+            // kernel limit for the N_TTY line discipline. A larger buffer doesn't
+            // help: each read() from a PTY master returns at most 4096 bytes
+            // regardless of the userspace buffer size.
             var buf: [4096]u8 = undefined;
             const n_opt: ?usize = posix.read(pty_fd, &buf) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk null;

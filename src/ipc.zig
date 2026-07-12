@@ -43,12 +43,14 @@ pub const Header = packed struct {
 pub const Resize = packed struct {
     rows: u16,
     cols: u16,
+    xpixel: u16 = 0,
+    ypixel: u16 = 0,
 };
 
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
-        return .{ .rows = ws.ws_row, .cols = ws.ws_col };
+        return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
     }
     return .{ .rows = 24, .cols = 160 };
 }
@@ -97,14 +99,16 @@ pub fn appendMessage(
     tag: Tag,
     data: []const u8,
 ) !void {
-    std.log.info("sending ipc message tag={s}", .{@tagName(tag)});
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
     };
-    try list.appendSlice(alloc, std.mem.asBytes(&header));
+    // Guarantee capacity for header + payload in one check to avoid
+    // intermediate realloc between the two appends on the hot path.
+    try list.ensureTotalCapacity(alloc, list.items.len + @sizeOf(Header) + data.len);
+    list.appendSliceAssumeCapacity(std.mem.asBytes(&header));
     if (data.len > 0) {
-        try list.appendSlice(alloc, data);
+        list.appendSliceAssumeCapacity(data);
     }
 }
 

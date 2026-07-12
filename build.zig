@@ -10,14 +10,9 @@ const macos_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
-// CDXC:ZmxBuild 2026-06-01-10:45:
-// Ghostex builds zmx for macOS during local start and app packaging. Zig 0.15.2 cannot link Mach-O with LLD, so keep LLVM enabled but let macOS targets use Zig's supported linker while preserving LLD for non-macOS targets.
-fn useLldForTarget(target: std.Build.ResolvedTarget) bool {
-    return target.result.os.tag != .macos;
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version string for release") orelse
         @as([]const u8, @import("build.zig.zon").version);
@@ -34,18 +29,15 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addOptions("build_options", options);
 
-    // CDXC:ZmxPersistence 2026-05-20-10:23:
-    // Ghostex bundles zmx from this submodule during `bun run start`.
-    // zmx only imports Ghostty's `ghostty-vt` Zig module, so keep the dependency in lib-vt mode and disable Ghostty's macOS app/xcframework outputs; those extra artifacts can require host SDK discovery that is unrelated to zmx and should not block local Ghostex starts.
-    const ghostty_dep_options = .{
+    const dep = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
         .@"emit-lib-vt" = true,
+        // Not redundant: in lib-vt mode emit-xcframework defaults to "xcodebuild
+        // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
+        // configure time and breaks builds without full Xcode.
         .@"emit-xcframework" = false,
-        .@"emit-macos-app" = false,
-    };
-
-    const dep = b.dependency("ghostty", ghostty_dep_options);
+    });
     exe_mod.addImport(
         "ghostty-vt",
         dep.module("ghostty-vt"),
@@ -57,7 +49,7 @@ pub fn build(b: *std.Build) void {
         const exe = b.addExecutable(.{
             .name = "zmx",
             .use_llvm = true,
-            .use_lld = useLldForTarget(target),
+            .use_lld = !is_macos,
             .root_module = exe_mod,
         });
         exe.linkLibC();
@@ -76,7 +68,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        const test_dep = b.dependency("ghostty", ghostty_dep_options);
+        const test_dep = b.dependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+            .@"emit-lib-vt" = true,
+            .@"emit-xcframework" = false,
+        });
         test_module.addImport(
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
@@ -84,19 +81,11 @@ pub fn build(b: *std.Build) void {
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             .use_llvm = true,
-            .use_lld = useLldForTarget(target),
+            .use_lld = !is_macos,
         });
         exe_unit_tests.linkLibC();
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
-    }
-
-    // Integration tests (bats)
-    {
-        const integration_step = b.step("test-integration", "Run bats integration tests");
-        const bats = b.addSystemCommand(&.{ "bats", "test/session.bats" });
-        bats.step.dependOn(b.getInstallStep());
-        integration_step.dependOn(&bats.step);
     }
 
     // Check for LSP integration
@@ -105,7 +94,7 @@ pub fn build(b: *std.Build) void {
         const exe_check = b.addExecutable(.{
             .name = "zmx",
             .use_llvm = true,
-            .use_lld = useLldForTarget(target),
+            .use_lld = !is_macos,
             .root_module = exe_mod,
         });
         exe_check.linkLibC();
@@ -137,15 +126,15 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
                 .@"emit-lib-vt" = true,
                 .@"emit-xcframework" = false,
-                .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
             }
 
+            const is_local_macos = resolved.result.os.tag == .macos;
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
                 .use_llvm = true,
-                .use_lld = useLldForTarget(resolved),
+                .use_lld = !is_local_macos,
                 .root_module = release_mod,
             });
             release_exe.linkLibC();
@@ -173,17 +162,5 @@ pub fn build(b: *std.Build) void {
             release_step.dependOn(&install_tar.step);
             release_step.dependOn(&install_sha.step);
         }
-    }
-
-    // Upload artifacts to pgs
-    {
-        const upload_step = b.step("upload", "Upload docs and dist to pgs.sh:/zmx");
-        const gen_doc = b.addSystemCommand(&.{ "sh", "-c", "cat README.md | pdocs -tmpl index.tmpl -toc | ssh pgs.sh /zmx/index.html" });
-        const rsync_docs = b.addSystemCommand(&.{ "rsync", "-v", "./logo.png", "pgs.sh:/zmx/" });
-        const rsync_dist = b.addSystemCommand(&.{ "rsync", "-rv", "zig-out/dist/", "pgs.sh:/zmx/a" });
-
-        upload_step.dependOn(&gen_doc.step);
-        upload_step.dependOn(&rsync_docs.step);
-        upload_step.dependOn(&rsync_dist.step);
     }
 }
