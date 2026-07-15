@@ -137,6 +137,7 @@ pub fn main() !void {
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
+        var require_existing = false;
         var restore_visible_only = false;
         var prompt_editor_capabilities: u8 = 0;
         var session_name: []const u8 = "";
@@ -149,6 +150,10 @@ pub fn main() !void {
             }
             if (std.mem.eql(u8, arg, "--visible-only")) {
                 restore_visible_only = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--require-existing")) {
+                require_existing = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--prompt-editor=monaco")) {
@@ -198,7 +203,7 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path=<redacted>", .{});
-        return attach(&daemon, restore_visible_only, prompt_editor_capabilities);
+        return attach(&daemon, require_existing, restore_visible_only, prompt_editor_capabilities);
     } else if (std.mem.eql(u8, cmd, "prompt-editor-capability")) {
         var session_name: ?[]const u8 = null;
         while (args.next()) |arg| {
@@ -1535,7 +1540,7 @@ fn help() !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach [--visible-only] [--prompt-editor=monaco] <name> [command...]  Attach to session, creating if needed
+        \\  [a]ttach [--require-existing] [--visible-only] [--prompt-editor=monaco] <name> [command...]  Attach; creates unless --require-existing
         \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
@@ -2253,14 +2258,26 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8, prompt_editor_capabilit
     };
 }
 
-fn attach(daemon: *Daemon, restore_visible_only: bool, prompt_editor_capabilities: u8) !void {
+fn attach(
+    daemon: *Daemon,
+    require_existing: bool,
+    restore_visible_only: bool,
+    prompt_editor_capabilities: u8,
+) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(daemon, sesh, prompt_editor_capabilities);
     }
 
-    const result = try daemon.ensureSession();
-    if (result.is_daemon) return;
+    // CDXC:GhostexZmxProviderOwnership 2026-07-15:
+    // Ghostex-owned attach commands use --require-existing so an attach can
+    // never win a missing-provider race and create a plain shell without the
+    // gxserver initialization command. Normal zmx attach keeps its historical
+    // create-if-missing behavior for direct CLI users and non-Ghostex clients.
+    if (!require_existing) {
+        const result = try daemon.ensureSession();
+        if (result.is_daemon) return;
+    }
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
     std.log.info("attached session=<redacted>", .{});
@@ -2342,7 +2359,12 @@ fn attach(daemon: *Daemon, restore_visible_only: bool, prompt_editor_capabilitie
                     .created_at = @intCast(std.time.timestamp()),
                     .leader_client_fd = null,
                 };
-                return attach(&target_daemon, restore_visible_only, prompt_editor_capabilities);
+                return attach(
+                    &target_daemon,
+                    require_existing,
+                    restore_visible_only,
+                    prompt_editor_capabilities,
+                );
             }
         },
     }
