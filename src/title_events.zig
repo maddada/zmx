@@ -82,7 +82,11 @@ pub const Coalescer = struct {
     pub fn takeDue(self: *Coalescer, alloc: std.mem.Allocator, now_ms: i64) !?[]u8 {
         if (self.isPendingDue(now_ms)) {
             self.pending = false;
-            return try self.emitLatest(alloc, now_ms, false);
+            // A short-lived semantic title can settle back to the previously
+            // emitted raw title before debounce (Codex /rename does this on
+            // WSL). The completed burst is still a meaningful notification to
+            // gxserver, which uses it to reconcile canonical agent metadata.
+            return try self.emitLatest(alloc, now_ms, true);
         }
         if (self.isHeartbeatDue(now_ms)) {
             self.pending_heartbeat = false;
@@ -102,11 +106,6 @@ pub const Coalescer = struct {
             if (std.mem.eql(u8, last_emitted, signature)) {
                 if (!allow_repeated_signature) {
                     return null;
-                }
-                if (self.last_emitted_title) |last_title| {
-                    if (std.mem.eql(u8, last_title, title)) {
-                        return null;
-                    }
                 }
             }
         }
@@ -435,6 +434,24 @@ test "coalescer does not heartbeat unchanged raw title" {
     try std.testing.expectEqual(@as(i32, -1), coalescer.pollTimeoutMs(max_settle_ms));
     const repeated = try coalescer.takeDue(alloc, max_settle_ms);
     try std.testing.expect(repeated == null);
+}
+
+test "coalescer notifies when a semantic burst settles back to the previous title" {
+    const alloc = std.testing.allocator;
+    var coalescer = Coalescer{};
+    defer coalescer.deinit(alloc);
+
+    try coalescer.observe(alloc, "ghostex", 0);
+    const initial = try coalescer.takeDue(alloc, debounce_ms);
+    try std.testing.expect(initial != null);
+    alloc.free(initial.?);
+
+    try coalescer.observe(alloc, "Fix Command Pane Titles", 1_100);
+    try coalescer.observe(alloc, "ghostex", 1_200);
+    const settled = try coalescer.takeDue(alloc, 1_200 + debounce_ms);
+    try std.testing.expect(settled != null);
+    defer alloc.free(settled.?);
+    try std.testing.expectEqualStrings("ghostex", settled.?);
 }
 
 test "semantic signature ignores cursor working dot animation" {
