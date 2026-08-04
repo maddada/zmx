@@ -2071,28 +2071,51 @@ fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
         w.interface.flush() catch {};
         return error.SessionNotFound;
     }
-    const fd = ipc.connectSession(socket_path) catch |err| {
-        std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        var buf: [4096]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
-        if (force or err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(dir, session_name);
-            w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
-        } else {
-            w.interface.print(
-                "session {s} is unresponsive ({s})\ndaemon may be busy: try again, add `--force` flag, or kill the process directly\n",
-                .{ session_name, @errorName(err) },
-            ) catch {};
-        }
-        w.interface.flush() catch {};
-        return;
-    };
+    {
+        const fd = ipc.connectSession(socket_path) catch |err| {
+            std.log.err("session unresponsive: {s}", .{@errorName(err)});
+            var buf: [4096]u8 = undefined;
+            var w = std.fs.File.stdout().writer(&buf);
+            if (force or err == error.ConnectionRefused) {
+                socket.cleanupStaleSocket(dir, session_name);
+                w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
+            } else {
+                w.interface.print(
+                    "session {s} is unresponsive ({s})\ndaemon may be busy: try again, add `--force` flag, or kill the process directly\n",
+                    .{ session_name, @errorName(err) },
+                ) catch {};
+            }
+            w.interface.flush() catch {};
+            return;
+        };
+        defer posix.close(fd);
+        ipc.send(fd, .Kill, "") catch |err| switch (err) {
+            error.BrokenPipe, error.ConnectionResetByPeer => {},
+            else => return err,
+        };
+    }
 
-    defer posix.close(fd);
-    ipc.send(fd, .Kill, "") catch |err| switch (err) {
-        error.BrokenPipe, error.ConnectionResetByPeer => return,
-        else => return err,
-    };
+    // The daemon intentionally spends 500 ms shutting down its process group
+    // after it receives Kill. Do not report success while its socket can still
+    // accept a new client: callers such as Ghostex Full Reload immediately
+    // start the same session name again, and an early return makes that start
+    // attach to the dying daemon instead of creating the replacement.
+    const shutdown_deadline_ms = std.time.milliTimestamp() + 10_000;
+    while (try socket.sessionExists(dir, session_name)) {
+        if (ipc.connectSession(socket_path)) |probe_fd| {
+            posix.close(probe_fd);
+        } else |err| switch (err) {
+            error.ConnectionRefused => {
+                socket.cleanupStaleSocket(dir, session_name);
+                break;
+            },
+            error.Unexpected => {},
+        }
+        if (std.time.milliTimestamp() >= shutdown_deadline_ms) {
+            return error.SessionKillTimedOut;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
 
     var buf: [100]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
