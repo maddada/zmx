@@ -38,6 +38,7 @@ var sig_pipe: [2]posix.fd_t = .{ -1, -1 };
 const O_NONBLOCK: usize = 1 << @bitOffsetOf(posix.O, "NONBLOCK");
 const ghostexRefreshSequence = "\x1b]1337;ZMX_REFRESH\x07";
 const promptEditorCapabilityMonaco: u8 = 1;
+const promptEditorCapabilityCodeServer: u8 = 2;
 
 const SessionMatch = struct {
     name: []const u8,
@@ -160,10 +161,16 @@ pub fn main() !void {
                 prompt_editor_capabilities |= promptEditorCapabilityMonaco;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--prompt-editor=code-server")) {
+                prompt_editor_capabilities |= promptEditorCapabilityCodeServer;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--prompt-editor")) {
                 const value = args.next() orelse "";
                 if (std.mem.eql(u8, value, "monaco")) {
                     prompt_editor_capabilities |= promptEditorCapabilityMonaco;
+                } else if (std.mem.eql(u8, value, "code-server")) {
+                    prompt_editor_capabilities |= promptEditorCapabilityCodeServer;
                 }
                 continue;
             }
@@ -1032,10 +1039,12 @@ const Daemon = struct {
         var capability: []const u8 = "editor";
         if (self.leader_client_fd) |leader_fd| {
             for (self.clients.items) |existing_client| {
-                if (existing_client.socket_fd == leader_fd and
-                    existing_client.prompt_editor_capabilities & promptEditorCapabilityMonaco != 0)
-                {
-                    capability = "monaco";
+                if (existing_client.socket_fd == leader_fd) {
+                    if (existing_client.prompt_editor_capabilities & promptEditorCapabilityCodeServer != 0) {
+                        capability = "code-server";
+                    } else if (existing_client.prompt_editor_capabilities & promptEditorCapabilityMonaco != 0) {
+                        capability = "monaco";
+                    }
                     break;
                 }
             }
@@ -1540,7 +1549,7 @@ fn help() !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach [--require-existing] [--visible-only] [--prompt-editor=monaco] <name> [command...]  Attach; creates unless --require-existing
+        \\  [a]ttach [--require-existing] [--visible-only] [--prompt-editor=monaco|code-server] <name> [command...]  Attach; creates unless --require-existing
         \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
