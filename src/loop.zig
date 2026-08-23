@@ -6,6 +6,7 @@ const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
+const title_events = @import("title_events.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -13,9 +14,70 @@ const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
 
+/// Prompt-editor capability bits advertised by an attaching client on .Init.
+pub const prompt_editor_capability_monaco: u8 = 1;
+pub const prompt_editor_capability_code_server: u8 = 2;
+
+/// Ghostex sends this private OSC through the attached terminal to ask for a
+/// display refresh. `clientLoop` consumes the exact sequence locally and turns
+/// it into a Refresh IPC so the shell/PTY never receives the control bytes.
+pub const ghostex_refresh_sequence = "\x1b]1337;ZMX_REFRESH\x07";
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32) !ClientResult {
+/// Split raw client stdin into IPC messages, converting Ghostex's private
+/// refresh OSC into a Refresh IPC instead of forwarding it to the PTY.
+///
+/// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex sends a private OSC refresh
+/// request through the attached terminal because that path is already connected
+/// to the correct zmx client. zmx must consume that exact sequence locally and
+/// convert it to Refresh IPC so the shell/PTY never receives the control bytes.
+fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
+    var remaining = input;
+    while (std.mem.indexOf(u8, remaining, ghostex_refresh_sequence)) |index| {
+        if (index > 0) {
+            try ipc.appendMessage(gpa, sock_write_buf, .Input, remaining[0..index]);
+        }
+        try ipc.appendMessage(gpa, sock_write_buf, .Refresh, "");
+        remaining = remaining[index + ghostex_refresh_sequence.len ..];
+    }
+    if (remaining.len > 0) {
+        try ipc.appendMessage(gpa, sock_write_buf, .Input, remaining);
+    }
+}
+
+test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendClientInputMessages(alloc, &out, "before" ++ ghostex_refresh_sequence ++ "after");
+
+    var offset: usize = 0;
+    const first_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Input, first_header.tag);
+    const first_len: usize = @intCast(first_header.len);
+    try std.testing.expectEqualStrings("before", out.items[offset..][0..first_len]);
+    offset += first_len;
+
+    const refresh_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Refresh, refresh_header.tag);
+    try std.testing.expectEqual(@as(u32, 0), refresh_header.len);
+
+    const second_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
+    offset += @sizeOf(ipc.Header);
+    try std.testing.expectEqual(ipc.Tag.Input, second_header.tag);
+    const second_len: usize = @intCast(second_header.len);
+    try std.testing.expectEqualStrings("after", out.items[offset..][0..second_len]);
+}
+
+pub fn clientLoop(client_sock_fd: i32, prompt_editor_capabilities: u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .Debug) {
@@ -41,9 +103,13 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     var sock_write_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     defer sock_write_buf.deinit(gpa);
 
-    // Send init message with terminal size (buffered)
+    // Send init message with terminal size (buffered), plus the client's
+    // prompt-editor capability byte. Omitting the byte means "machine editor".
     const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    try ipc.appendMessage(gpa, &sock_write_buf, .Init, std.mem.asBytes(&size));
+    var init_payload: [@sizeOf(ipc.Resize) + 1]u8 = undefined;
+    @memcpy(init_payload[0..@sizeOf(ipc.Resize)], std.mem.asBytes(&size));
+    init_payload[@sizeOf(ipc.Resize)] = prompt_editor_capabilities;
+    try ipc.appendMessage(gpa, &sock_write_buf, .Init, &init_payload);
 
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
@@ -119,7 +185,7 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Input, buf[0..n]);
+                        try appendClientInputMessages(gpa, &sock_write_buf, buf[0..n]);
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -274,13 +340,17 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        // A pending title observation needs a bounded poll so the coalescer's
+        // debounce / max-settle / heartbeat deadlines still fire on an
+        // otherwise idle session. -1 when nothing is pending.
+        _ = try lib_posix.poll(poll_fds.items, daemon.titlePollTimeoutMs(io));
+        try daemon.flushTitleIfDue(gpa, io);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             std.log.info(
-                "SIGTERM received, shutting down gracefully session={s}",
-                .{daemon.session_name},
+                "SIGTERM received, shutting down gracefully session=<redacted>",
+                .{},
             );
             break :daemon_loop;
         }
@@ -338,6 +408,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.setPwd(&term);
+                    if (term.getTitle()) |title| {
+                        try daemon.observeTerminalTitle(gpa, io, title);
+                    }
                     daemon.has_pty_output = true;
 
                     // When no real terminal client has attached yet, respond to
@@ -370,6 +443,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
+                                if (c.is_title_watcher) continue;
                                 ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -388,6 +462,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
+                        if (client.is_title_watcher) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -475,7 +550,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData => {},
+                        .Refresh => try daemon.handleRefresh(gpa, client, &term),
+                        .RefreshIfStale => try daemon.handleRefreshIfStale(gpa, client, pty_fd, &term, msg.payload),
+                        .PromptEditorCapability => try daemon.handlePromptEditorCapability(gpa, client),
+                        .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
+                        .Ack, .TaskComplete, .LabelData, .TitleObserved => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -528,6 +607,16 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    /// True once the client sent .Init, i.e. it is a real attached terminal
+    /// that can render an Output repaint.
+    is_terminal: bool = false,
+    /// True for `zmx watch-title` clients. They are process plumbing, not a
+    /// user-visible client: they never receive Output/TaskComplete and are
+    /// excluded from the `zmx list` client count.
+    is_title_watcher: bool = false,
+    /// Prompt-editor capability bits this client advertised on .Init.
+    /// See `prompt_editor_capability_monaco` / `_code_server`.
+    prompt_editor_capabilities: u8 = 0,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -582,6 +671,11 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    title_coalescer: title_events.Coalescer = .{},
+    /// Set by `run()` when this process actually created the session. Lets a
+    /// caller tell "created" from "already existed", which `ensureSession`'s
+    /// is-daemon-proc return value cannot express on its own.
+    created_session: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -603,6 +697,7 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
+        self.title_coalescer.deinit(gpa);
         gpa.free(self.socket_path);
     }
 
@@ -695,7 +790,8 @@ pub const Daemon = struct {
     }
 
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
-        std.log.info("creating session={s}", .{sesh_name});
+        std.log.info("creating session=<redacted>", .{});
+        self.created_session = true;
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
         const log_fd = log.log_system.file.?.handle;
 
@@ -896,6 +992,35 @@ pub const Daemon = struct {
         return error.NoLeaderFound;
     }
 
+    /// Resize the PTY and the daemon's own terminal to `resize`.
+    ///
+    /// Extracted from handleInit/handleResize because handleRefreshIfStale
+    /// needs the same sequence from a third call site.
+    fn applyTerminalResize(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        resize: ipc.Resize,
+    ) !void {
+        _ = self;
+        var ws: cross.c.struct_winsize = .{
+            .ws_row = resize.rows,
+            .ws_col = resize.cols,
+            .ws_xpixel = resize.xpixel,
+            .ws_ypixel = resize.ypixel,
+        };
+        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
+        // Disable prompt_redraw before resize. The daemon's internal terminal
+        // would otherwise clear prompt lines expecting the shell to redraw them,
+        // but the shell's redraw goes to the PTY (forwarded to clients), not to
+        // this daemon terminal. The clearing corrupts the daemon's snapshot state.
+        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        try term.resize(gpa, .{ .cols = resize.cols, .rows = resize.rows });
+    }
+
     pub fn handleInit(
         self: *Daemon,
         gpa: std.mem.Allocator,
@@ -904,7 +1029,16 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len < @sizeOf(ipc.Resize)) return;
+        client.is_terminal = true;
+        // CDXC:PromptEditor 2026-06-06-16:40: zmx attach clients advertise
+        // prompt-editor support explicitly; an omitted capability byte means
+        // the machine editor, so inherited shell environment cannot make SSH,
+        // mobile, or TUI clients open a host-only popup.
+        client.prompt_editor_capabilities = if (payload.len > @sizeOf(ipc.Resize))
+            payload[@sizeOf(ipc.Resize)]
+        else
+            0;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -941,26 +1075,8 @@ pub const Daemon = struct {
 
         // only resize if leader
         if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload);
-            var ws: cross.c.struct_winsize = .{
-                .ws_row = resize.rows,
-                .ws_col = resize.cols,
-                .ws_xpixel = resize.xpixel,
-                .ws_ypixel = resize.ypixel,
-            };
-            _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-            // Disable prompt_redraw before resize. The daemon's internal terminal
-            // would otherwise clear prompt lines expecting the shell to redraw them,
-            // but the shell's redraw goes to the PTY (forwarded to clients), not to
-            // this daemon terminal. The clearing corrupts the daemon's snapshot state.
-            const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-            term.flags.shell_redraws_prompt = .false;
-            defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-            const opts = ghostty_vt.Terminal.Resize{
-                .cols = resize.cols,
-                .rows = resize.rows,
-            };
-            try term.resize(gpa, opts);
+            const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+            try self.applyTerminalResize(gpa, pty_fd, term, resize);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -986,23 +1102,160 @@ pub const Daemon = struct {
         if (self.leader_client_fd != client.socket_fd) return;
 
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
-        var ws: cross.c.struct_winsize = .{
-            .ws_row = resize.rows,
-            .ws_col = resize.cols,
-            .ws_xpixel = resize.xpixel,
-            .ws_ypixel = resize.ypixel,
-        };
-        _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        // Disable prompt_redraw before resize (same rationale as handleInit).
-        const saved_prompt_redraw = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
-        const opts = ghostty_vt.Terminal.Resize{
-            .cols = resize.cols,
-            .rows = resize.rows,
-        };
-        try term.resize(gpa, opts);
+        try self.applyTerminalResize(gpa, pty_fd, term, resize);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
+    }
+
+    // ==================================================================
+    // Ghostex fork: display refresh, title observation, prompt editor
+    // ==================================================================
+
+    fn appendVisibleRefresh(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) void {
+        if (!self.has_pty_output) return;
+        if (util.serializeVisibleTerminalState(gpa, term)) |term_output| {
+            std.log.debug("serialize visible terminal state", .{});
+            const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
+            defer gpa.free(term_output);
+            defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
+            ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
+                std.log.warn(
+                    "failed to buffer visible terminal refresh for client err={s}",
+                    .{@errorName(err)},
+                );
+                return;
+            };
+            client.has_pending_output = true;
+        }
+    }
+
+    /// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex refreshes stale zmx-backed
+    /// panes by asking the zmx daemon to repaint attached terminal clients from
+    /// tracked VT state. This is intentionally an IPC/display operation, never
+    /// PTY input, so refresh cannot type escape bytes into the user's shell.
+    pub fn handleRefresh(self: *Daemon, gpa: std.mem.Allocator, requesting_client: *Client, term: *ghostty_vt.Terminal) !void {
+        var refreshed_count: usize = 0;
+        for (self.clients.items) |client| {
+            if (!client.is_terminal) continue;
+            self.appendVisibleRefresh(gpa, client, term);
+            refreshed_count += 1;
+        }
+        if (refreshed_count == 0) {
+            self.appendVisibleRefresh(gpa, requesting_client, term);
+        }
+        try ipc.appendMessage(gpa, &requesting_client.write_buf, .Ack, "");
+        requesting_client.has_pending_output = true;
+    }
+
+    /// CDXC:ZmxPersistence 2026-06-05-21:27: Mac pane clicks should repair
+    /// sessions resized by another client, such as an iPhone attach, without
+    /// repainting on every normal terminal click. Compare the caller's current
+    /// grid to the daemon VT grid; ACK without Output when they already match
+    /// so clicks do not scroll the terminal to the bottom.
+    pub fn handleRefreshIfStale(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        requesting_client: *Client,
+        pty_fd: i32,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.Resize)) {
+            try ipc.appendMessage(gpa, &requesting_client.write_buf, .Ack, "0");
+            requesting_client.has_pending_output = true;
+            return;
+        }
+
+        const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+        const current_rows: u16 = @intCast(term.screens.active.pages.rows);
+        const current_cols: u16 = @intCast(term.screens.active.pages.cols);
+        const is_stale = resize.rows != current_rows or resize.cols != current_cols;
+        if (is_stale) {
+            try self.applyTerminalResize(gpa, pty_fd, term, resize);
+            for (self.clients.items) |client| {
+                if (!client.is_terminal) continue;
+                self.appendVisibleRefresh(gpa, client, term);
+            }
+        }
+        try ipc.appendMessage(gpa, &requesting_client.write_buf, .Ack, if (is_stale) "1" else "0");
+        requesting_client.has_pending_output = true;
+    }
+
+    /// CDXC:PromptEditor 2026-06-06-16:40:
+    /// Ctrl+G prompt-editor routing must use the current zmx attach client, not
+    /// stale shell environment inherited when the long-lived session was
+    /// created. Only a leader client that explicitly advertised support may open
+    /// a host editor; every missing or non-advertised client returns "editor" so
+    /// TUI, mobile, and plain SSH attaches stay on the machine editor.
+    /// CDXC:PromptEditorBackend 2026-06-30-03:11: Non-Monaco zmx clients
+    /// advertise "editor" instead of the old gte sentinel because Ctrl+G
+    /// fallback now runs the machine's EDITOR/VISUAL command.
+    pub fn handlePromptEditorCapability(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        var capability: []const u8 = "editor";
+        if (self.leader_client_fd) |leader_fd| {
+            for (self.clients.items) |existing_client| {
+                if (existing_client.socket_fd == leader_fd) {
+                    if (existing_client.prompt_editor_capabilities & prompt_editor_capability_code_server != 0) {
+                        capability = "code-server";
+                    } else if (existing_client.prompt_editor_capabilities & prompt_editor_capability_monaco != 0) {
+                        capability = "monaco";
+                    }
+                    break;
+                }
+            }
+        }
+        try ipc.appendMessage(gpa, &client.write_buf, .PromptEditorCapability, capability);
+        client.has_pending_output = true;
+    }
+
+    /// CDXC:ZmxTitleObservations 2026-06-01-10:17:
+    /// Title watchers should not receive the raw title captured at subscription
+    /// time unless zmx has already emitted it as stable. New or restored
+    /// surfaces can briefly expose shell/bootstrap titles before the agent
+    /// redraws, so the first observed title must pass through the same 1s
+    /// debounce and 6s max-settle window as later changes.
+    pub fn handleTitleSubscribe(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+    ) !void {
+        client.is_title_watcher = true;
+        if (self.title_coalescer.lastEmittedTitle()) |title| {
+            try self.sendTitleToClient(gpa, client, title);
+        }
+        if (term.getTitle()) |title| {
+            try self.title_coalescer.observe(gpa, title, nowMs(io));
+        }
+    }
+
+    pub fn observeTerminalTitle(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, title: []const u8) !void {
+        try self.title_coalescer.observe(gpa, title, nowMs(io));
+    }
+
+    pub fn titlePollTimeoutMs(self: *const Daemon, io: std.Io) i32 {
+        return self.title_coalescer.pollTimeoutMs(nowMs(io));
+    }
+
+    pub fn flushTitleIfDue(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) !void {
+        const title = try self.title_coalescer.takeDue(gpa, nowMs(io));
+        if (title) |value| {
+            defer gpa.free(value);
+            try self.broadcastTitle(gpa, value);
+        }
+    }
+
+    fn broadcastTitle(self: *Daemon, gpa: std.mem.Allocator, title: []const u8) !void {
+        for (self.clients.items) |client| {
+            if (!client.is_title_watcher) continue;
+            try self.sendTitleToClient(gpa, client, title);
+        }
+    }
+
+    fn sendTitleToClient(self: *Daemon, gpa: std.mem.Allocator, client: *Client, title: []const u8) !void {
+        _ = self;
+        try ipc.appendMessage(gpa, &client.write_buf, .TitleObserved, title);
+        client.has_pending_output = true;
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {
@@ -1042,7 +1295,16 @@ pub const Daemon = struct {
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
-        info.clients_len = self.clients.items.len - 1;
+        // CDXC:ZmxTitleObservations 2026-06-01-10:17:
+        // gxserver keeps a long-lived title watcher attached to each observed
+        // zmx session. That watcher is process plumbing, not a user-visible
+        // client, so `zmx list` client counts must ignore it while still
+        // excluding this transient Info request.
+        var visible_client_count: usize = 0;
+        for (self.clients.items) |existing_client| {
+            if (!existing_client.is_title_watcher) visible_client_count += 1;
+        }
+        info.clients_len = if (visible_client_count > 0) visible_client_count - 1 else 0;
         info.pid = self.pid;
         info.created_at = self.created_at;
         info.task_ended_at = self.task_ended_at orelse 0;
@@ -1195,6 +1457,7 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
+            if (client.is_title_watcher) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }

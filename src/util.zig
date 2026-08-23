@@ -717,8 +717,10 @@ pub fn isUserInput(payload: []const u8) bool {
                     if (csi.final == 'I' or csi.final == 'O') return false;
                 },
                 .execute => |code| {
-                    // looking for CR, LF, tab, and backspace
-                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) return true;
+                    // CR, LF, tab, backspace, and Ctrl+G/BEL are user input.
+                    // Ctrl+G opens the prompt editor, so the pressing client
+                    // must become leader before prompt-editor-capability runs.
+                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08 or code == 0x07) return true;
                 },
                 else => {},
             }
@@ -886,6 +888,75 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
+/// Serialize only the active viewport, as a clear-and-repaint snapshot.
+///
+/// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex can ask an already attached
+/// zmx client to repaint a stale visible pane. Refresh output must not include
+/// scrollback because the client already owns that history; emit only a
+/// clear-and-repaint snapshot of the active viewport so no bytes reach the PTY
+/// and no scrollback is duplicated.
+pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    // Same rationale as serializeTerminalState: synchronized output (DECSET
+    // 2026) is a handshake with the *current* client, so replaying it would
+    // make the repainted client defer rendering until its own timeout fires.
+    const had_synchronized_output = term.modes.get(.synchronized_output);
+    if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, false);
+    }
+    defer if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, true);
+    };
+
+    builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+
+    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    const pages = &term.screens.active.pages;
+    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
+    const active_br = pages.pin(.{
+        .active = .{
+            .x = @intCast(pages.cols - 1),
+            .y = @intCast(pages.rows - 1),
+        },
+    });
+
+    if (active_tl != null and active_br != null) {
+        vis_fmt.content = .{
+            .selection = ghostty_vt.Selection.init(
+                active_tl.?,
+                active_br.?,
+                false,
+            ),
+        };
+    }
+    vis_fmt.extra = .{
+        .palette = false,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = false,
+        .pwd = false, // emitted below without the sentinel the formatter includes
+        .keyboard = true,
+        .screen = .all,
+    };
+
+    vis_fmt.format(&builder.writer) catch |err| {
+        std.log.warn("failed to format visible terminal state err={s}", .{@errorName(err)});
+        return null;
+    };
+
+    writePwd(&builder.writer, term);
+
+    const output = builder.writer.buffered();
+    if (output.len == 0) return null;
+
+    return alloc.dupe(u8, output) catch |err| {
+        std.log.warn("failed to allocate visible terminal state err={s}", .{@errorName(err)});
         return null;
     };
 }

@@ -8,6 +8,7 @@ const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
+const title_events = @import("title_events.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
@@ -159,8 +160,61 @@ pub fn main(init: std.process.Init) !void {
         daemon.command = command;
         daemon.setCwd(cwd);
         daemon.shell = shell_env;
-        std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(gpa, io, &daemon, parsed.labels);
+        std.log.info("socket path=<redacted>", .{});
+        return attach(
+            gpa,
+            io,
+            &daemon,
+            parsed.labels,
+            parsed.require_existing,
+            parsed.prompt_editor_capabilities,
+        );
+    } else if (std.mem.eql(u8, cmd, "prompt-editor-capability")) {
+        var session_name: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (detectHelp(arg)) return help(io);
+            if (session_name == null) session_name = arg;
+        }
+        const sesh_env = socket.getSeshNameFromEnv();
+        const sesh = try socket.getSeshName(gpa, session_name orelse sesh_env);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+        return printPromptEditorCapability(gpa, io, socket_path);
+    } else if (std.mem.eql(u8, cmd, "refresh-if-stale")) {
+        const session_name = args.next() orelse "";
+        if (detectHelp(session_name)) return help(io);
+        if (session_name.len == 0) return error.SessionNameRequired;
+        const rows_arg = args.next() orelse return error.RowsRequired;
+        const cols_arg = args.next() orelse return error.ColsRequired;
+        const rows = try std.fmt.parseInt(u16, rows_arg, 10);
+        const cols = try std.fmt.parseInt(u16, cols_arg, 10);
+        if (rows == 0 or cols == 0) return error.InvalidTerminalSize;
+
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+        return refreshIfStale(gpa, io, &cfg, sesh, socket_path, .{ .rows = rows, .cols = cols });
+    } else if (std.mem.eql(u8, cmd, "watch-title")) {
+        const session_name = args.next() orelse "";
+        if (detectHelp(session_name)) return help(io);
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+        return watchTitle(gpa, io, socket_path);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -170,9 +224,18 @@ pub fn main(init: std.process.Init) !void {
         var cmd_args_raw: std.ArrayList([]const u8) = .empty;
         defer cmd_args_raw.deinit(gpa);
         var detached = false;
+        var initial_command = false;
         while (args.next()) |arg| {
             if (std.mem.startsWith(u8, arg, "-d")) {
                 detached = true;
+            } else if (std.mem.eql(u8, arg, "--initial-command")) {
+                // CDXC:ZmxProviderStartup 2026-06-08-21:18:
+                // Ghostex restore must create missing zmx providers with an
+                // initial argv instead of sending large restore scripts through
+                // shell input. The flag is intentionally a no-op for existing
+                // sessions so stale probes cannot replay startup text into a
+                // live terminal.
+                initial_command = true;
             } else {
                 try cmd_args_raw.append(gpa, arg);
             }
@@ -191,10 +254,16 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.setCwd(cwd);
-        daemon.is_task_mode = true;
+        // With --initial-command the argv becomes the session's initial process
+        // (exec'd by createCmdZ) instead of text typed into a task-mode bash.
+        daemon.command = if (initial_command and cmd_args_raw.items.len > 0)
+            cmd_args_raw.items
+        else
+            null;
+        daemon.is_task_mode = !initial_command;
         daemon.shell = shell_env;
-        std.log.info("socket path={s}", .{daemon.socket_path});
-        return run(gpa, io, &daemon, detached, cmd_args_raw.items);
+        std.log.info("socket path=<redacted>", .{});
+        return run(gpa, io, &daemon, detached, cmd_args_raw.items, initial_command);
     } else if (std.mem.eql(u8, cmd, "send") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -421,10 +490,13 @@ fn help(io: std.Io) !void {
         \\Usage: zmx <command> [args...]
         \\
         \\Commands:
-        \\  [a]ttach [--labels kv] <name> [command...]  Attach to session, creating if needed
+        \\  [a]ttach [flags] <name> [command...]     Attach to session, creating if needed
         \\  [r]un <name> [-d] [command...]           Send command without attaching
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
+        \\  refresh-if-stale <name> <rows> <cols>    Repaint clients only when daemon grid differs
+        \\  watch-title <name>                       Stream coalesced title observations as JSON lines
+        \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short|--where k=v]          List active sessions
@@ -447,10 +519,20 @@ fn help(io: std.Io) !void {
         \\  `zmx set` takes. A caller that creates and then labels in two steps
         \\  leaves an unlabelled session behind if it dies between them.
         \\
+        \\  --require-existing refuses to create the session, so a racing attach
+        \\  cannot replace a supervisor-owned session with a plain shell.
+        \\
+        \\  --prompt-editor monaco|code-server advertises that this client can
+        \\  host a rich prompt editor. Omitted means the machine's EDITOR.
+        \\
+        \\  Flags are only recognized before the session name; everything after
+        \\  it is the session command.
+        \\
         \\  Examples:
         \\    zmx attach dev
         \\    zmx attach dev vim
         \\    zmx attach --labels "project=api role=worker" build
+        \\    zmx attach --require-existing --prompt-editor=monaco dev
         \\
         \\History:
         \\  This should generally be used with `tail` to print the last lines
@@ -470,9 +552,13 @@ fn help(io: std.Io) !void {
         \\
         \\  `-d` will detach from the calling terminal. Use `wait` to track
         \\  its status.
+        \\  `--initial-command` creates a missing session by execing argv as
+        \\  the initial process instead of sending command text through the PTY.
+        \\  Existing sessions ignore the initial command.
         \\
         \\  Examples:
         \\    zmx run dev ls
+        \\    zmx run dev -d --initial-command /bin/zsh -lic 'echo ready; exec /bin/zsh -li'
         \\    zmx run dev zig build
         \\    zmx run dev grep -r TODO src
         \\    zmx run dev git log --oneline          # pager won't block
@@ -510,6 +596,25 @@ fn help(io: std.Io) !void {
         \\  Examples:
         \\    printf '\\r\\nhello\\r\\n' | zmx print dev
         \\    zmx print dev "$(printf '\\r\\nalert\\r\\n')"
+        \\
+        \\Refresh:
+        \\  `refresh-if-stale` repaints attached terminal clients from zmx's
+        \\  tracked terminal state, but only when the caller's grid differs from
+        \\  the daemon's. It does not send input to the PTY and the shell sees
+        \\  nothing. A client can also request a repaint in-band by writing
+        \\  OSC 1337;ZMX_REFRESH to its own PTY; zmx consumes that sequence
+        \\  locally and never forwards it to the shell.
+        \\
+        \\  Examples:
+        \\    zmx refresh-if-stale dev 40 120
+        \\
+        \\Watch title:
+        \\  Streams coalesced terminal-title observations as JSON lines. Spinner
+        \\  frames are collapsed to one semantic title, emitted after 1s of
+        \\  stability (6s max) with a 2s heartbeat while a title keeps animating.
+        \\
+        \\  Examples:
+        \\    zmx watch-title dev
         \\
         \\Write:
         \\  Writes stdin to file_path inside the session. Works over SSH.
@@ -1310,6 +1415,12 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
     };
 }
 
+fn promptEditorCapability(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "monaco")) return loop.prompt_editor_capability_monaco;
+    if (std.mem.eql(u8, value, "code-server")) return loop.prompt_editor_capability_code_server;
+    return 0;
+}
+
 const AttachArgs = struct {
     /// Session name, or "" when the caller did not name one.
     session_name: []const u8 = "",
@@ -1321,6 +1432,16 @@ const AttachArgs = struct {
     want_help: bool = false,
     /// `--labels` was given with nothing to apply.
     missing_labels_value: bool = false,
+    /// `--require-existing`: attach must not create the session.
+    ///
+    /// CDXC:GhostexZmxProviderOwnership 2026-07-15:
+    /// Ghostex-owned attach commands use --require-existing so an attach can
+    /// never win a missing-provider race and create a plain shell without the
+    /// gxserver initialization command. Normal zmx attach keeps its historical
+    /// create-if-missing behavior for direct CLI users and non-Ghostex clients.
+    require_existing: bool = false,
+    /// `--prompt-editor monaco|code-server` (also accepted as `--prompt-editor=`).
+    prompt_editor_capabilities: u8 = 0,
 };
 
 /// Parses the arguments that follow `zmx attach`. Flags are only recognized
@@ -1328,6 +1449,7 @@ const AttachArgs = struct {
 /// handed to the session.
 fn parseAttachArgs(argv: []const []const u8) AttachArgs {
     const labels_flag = "--labels";
+    const prompt_editor_flag = "--prompt-editor";
     var parsed: AttachArgs = .{};
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -1335,6 +1457,23 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             parsed.want_help = true;
             return parsed;
+        }
+        if (std.mem.eql(u8, arg, "--require-existing")) {
+            parsed.require_existing = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, prompt_editor_flag ++ "=")) {
+            parsed.prompt_editor_capabilities |= promptEditorCapability(arg[prompt_editor_flag.len + 1 ..]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, prompt_editor_flag)) {
+            // An unknown or missing value contributes no bits, which the daemon
+            // reads as "machine editor" -- the safe default.
+            if (i + 1 < argv.len) {
+                i += 1;
+                parsed.prompt_editor_capabilities |= promptEditorCapability(argv[i]);
+            }
+            continue;
         }
         if (std.mem.startsWith(u8, arg, labels_flag ++ "=")) {
             parsed.labels = arg[labels_flag.len + 1 ..];
@@ -1358,14 +1497,26 @@ fn parseAttachArgs(argv: []const []const u8) AttachArgs {
     return parsed;
 }
 
-fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, labels: ?[]const u8) !void {
+fn attach(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    daemon: *Daemon,
+    labels: ?[]const u8,
+    require_existing: bool,
+    prompt_editor_capabilities: u8,
+) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(gpa, io, daemon, sesh);
     }
 
-    const is_daemon_proc = try daemon.ensureSession(io);
-    if (is_daemon_proc) return;
+    // CDXC:GhostexZmxProviderOwnership 2026-07-15: --require-existing skips
+    // session creation entirely, so a racing attach can never replace a
+    // gxserver-owned provider with a plain shell.
+    if (!require_existing) {
+        const is_daemon_proc = try daemon.ensureSession(io);
+        if (is_daemon_proc) return;
+    }
 
     // The session exists now, so labels land before the client takes over the
     // terminal. Doing it here rather than in a follow-up `zmx set` keeps a
@@ -1425,7 +1576,7 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, labels: ?[]const 
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try loop.clientLoop(client_sock);
+    const looper = try loop.clientLoop(client_sock, prompt_editor_capabilities);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -1453,7 +1604,14 @@ fn attach(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, labels: ?[]const 
                 std.log.info("switching to new session cwd={s}", .{switch_cwd});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
-                return attach(gpa, io, &target_daemon, null);
+                return attach(
+                    gpa,
+                    io,
+                    &target_daemon,
+                    null,
+                    require_existing,
+                    prompt_editor_capabilities,
+                );
             }
         },
     }
@@ -1607,13 +1765,152 @@ fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     };
 }
 
-fn run(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, detached: bool, command_args: [][]const u8) !void {
+/// `zmx refresh-if-stale <name> <rows> <cols>`
+///
+/// Repaints attached terminal clients only when the daemon's grid differs from
+/// the caller's. Prints "refresh-if-stale applied" or "... skipped".
+fn refreshIfStale(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cfg: *Cfg,
+    session_name: []const u8,
+    socket_path: []const u8,
+    resize: ipc.Resize,
+) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
+    defer dir.close(io);
+
+    const fd = ipc.connectSession(socket_path) catch |err| {
+        std.log.err("session unresponsive: {s}", .{@errorName(err)});
+        if (err == error.ConnectionRefused) {
+            socket.cleanupStaleSocket(io, dir, session_name);
+            try w.interface.print("cleaned up stale session {s}\n", .{session_name});
+        } else {
+            try w.interface.print(
+                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
+                .{ session_name, @errorName(err) },
+            );
+        }
+        try w.interface.flush();
+        return;
+    };
+    defer lib_posix.close(fd);
+
+    ipc.send(fd, .RefreshIfStale, std.mem.asBytes(&resize)) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.BrokenPipe => return,
+        else => return err,
+    };
+
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, 1000) catch return error.Timeout;
+    if (poll_result == 0) return error.NoAckReceived;
+
+    var sb = try ipc.SocketBuffer.init(gpa);
+    defer sb.deinit();
+
+    const n = sb.read(fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .Ack) {
+            const status = if (msg.payload.len > 0 and msg.payload[0] == '1') "applied" else "skipped";
+            try w.interface.print("refresh-if-stale {s}\n", .{status});
+            try w.interface.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
+}
+
+/// `zmx prompt-editor-capability [name]`
+///
+/// Prints what the session's current leader client advertised: "monaco",
+/// "code-server", or "editor".
+fn printPromptEditorCapability(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
+    const payload = try ipc.roundTripForTag(
+        gpa,
+        socket_path,
+        .PromptEditorCapability,
+        "",
+        .PromptEditorCapability,
+    );
+    defer gpa.free(payload);
+
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    try stdout_writer.interface.print("{s}\n", .{payload});
+    try stdout_writer.interface.flush();
+}
+
+/// `zmx watch-title <name>`
+///
+/// Subscribes to the daemon's coalesced terminal-title observations and streams
+/// them as JSON lines ({"title":"..."}) until the session ends.
+fn watchTitle(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
+    const client_sock = try socket.sessionConnect(socket_path);
+    defer lib_posix.close(client_sock);
+    try ipc.send(client_sock, .TitleSubscribe, "");
+
+    var read_buf = try ipc.SocketBuffer.init(gpa);
+    defer read_buf.deinit();
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
+    while (true) {
+        const n = read_buf.read(client_sock) catch |err| switch (err) {
+            error.ConnectionResetByPeer, error.BrokenPipe => return,
+            else => return err,
+        };
+        if (n == 0) return;
+        while (read_buf.next()) |msg| {
+            if (msg.header.tag != .TitleObserved) continue;
+            try title_events.writeTitleJsonLine(stdout, msg.payload);
+            try stdout.flush();
+        }
+    }
+}
+
+fn run(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    daemon: *Daemon,
+    detached: bool,
+    command_args: [][]const u8,
+    initial_command: bool,
+) !void {
     var cmd_to_send: ?[]const u8 = null;
     var allocated_cmd: ?[]u8 = null;
     defer if (allocated_cmd) |cmd| gpa.free(cmd);
 
+    if (initial_command and command_args.len == 0) {
+        return error.CommandRequired;
+    }
+
     const is_daemon_proc = try daemon.ensureSession(io);
     if (is_daemon_proc) return;
+
+    // With --initial-command the argv was already exec'd as the session's
+    // initial process by ensureSession, so there is nothing to type into the
+    // PTY. An existing session deliberately ignores the command: a stale probe
+    // must never replay startup text into a live terminal.
+    if (initial_command) {
+        if (!daemon.created_session) {
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stdout().writer(io, &buf);
+            try w.interface.print(
+                "session \"{s}\" exists; initial command ignored\n",
+                .{daemon.session_name},
+            );
+            try w.interface.flush();
+        }
+        return;
+    }
 
     if (command_args.len > 0) {
         var cmd_list = std.ArrayList(u8).empty;
