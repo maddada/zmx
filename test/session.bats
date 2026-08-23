@@ -39,6 +39,127 @@ load test_helper
   [[ "$output" != *"created"* ]]
 }
 
+@test "run: initial-command creates provider without typing argv into shell" {
+  run "$ZMX" run t-init -d --initial-command /bin/zsh -lic 'printf "initial-command-marker\n"; exec /bin/zsh -li'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"session \"t-init\" created"* ]]
+
+  wait_for_session t-init
+  wait_for_output t-init "initial-command-marker"
+  run "$ZMX" history t-init
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"initial-command-marker"* ]]
+  # argv is exec'd, never echoed through the PTY as shell input
+  [[ "$output" != *"--initial-command"* ]]
+  [[ "$output" != *"/bin/zsh -lic"* ]]
+}
+
+@test "run: initial-command is ignored for an existing session" {
+  "$ZMX" run t-init-exists -d --initial-command /bin/sh -c 'printf "first-marker\n"; exec /bin/sh'
+  wait_for_session t-init-exists
+  wait_for_output t-init-exists "first-marker"
+
+  run "$ZMX" run t-init-exists -d --initial-command /bin/sh -c 'printf "second-marker\n"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"initial command ignored"* ]]
+  [[ "$output" != *"created"* ]]
+
+  run "$ZMX" history t-init-exists
+  [[ "$output" != *"second-marker"* ]]
+}
+
+@test "run: initial-command requires a command argument" {
+  run "$ZMX" run t-init-nocmd -d --initial-command
+  [ "$status" -ne 0 ]
+
+  run "$ZMX" list --short
+  [[ "$output" != *"t-init-nocmd"* ]]
+}
+
+@test "attach --require-existing fails instead of creating a session" {
+  run "$ZMX" attach --require-existing t-missing
+  [ "$status" -ne 0 ]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"t-missing"* ]]
+}
+
+@test "refresh-if-stale: skips when the daemon grid already matches" {
+  "$ZMX" run t-refresh -d --initial-command /bin/sh -c 'printf "refresh-marker\n"; exec /bin/sh'
+  wait_for_session t-refresh
+  wait_for_output t-refresh "refresh-marker"
+
+  # The daemon's grid comes from the creating client's terminal size. Ask with
+  # a deliberately different grid: that is stale and must be applied.
+  run "$ZMX" refresh-if-stale t-refresh 41 121
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refresh-if-stale applied"* ]]
+
+  # Asking again with the same grid is now a no-op.
+  run "$ZMX" refresh-if-stale t-refresh 41 121
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refresh-if-stale skipped"* ]]
+}
+
+@test "refresh-if-stale: requires session, rows, and cols" {
+  run "$ZMX" refresh-if-stale
+  [ "$status" -ne 0 ]
+  run "$ZMX" refresh-if-stale t-refresh-args
+  [ "$status" -ne 0 ]
+  run "$ZMX" refresh-if-stale t-refresh-args 40
+  [ "$status" -ne 0 ]
+}
+
+@test "prompt-editor-capability: reports editor for a non-advertising client" {
+  "$ZMX" run t-cap -d --initial-command /bin/sh -c 'printf "cap-marker\n"; exec /bin/sh'
+  wait_for_session t-cap
+  wait_for_output t-cap "cap-marker"
+
+  run "$ZMX" prompt-editor-capability t-cap
+  [ "$status" -eq 0 ]
+  [[ "$output" == "editor" ]]
+}
+
+@test "watch-title: streams a coalesced title observation as JSON" {
+  "$ZMX" run t-title -d --initial-command /bin/sh -c 'printf "title-marker\n"; exec /bin/sh'
+  wait_for_session t-title
+  wait_for_output t-title "title-marker"
+
+  # watch-title streams until the session dies, so read it in the background
+  # and stop once the coalescer has emitted (1s debounce + margin).
+  "$ZMX" watch-title t-title > "$BATS_TEST_TMPDIR/titles.jsonl" &
+  local watcher=$!
+  sleep 0.3
+  "$ZMX" print t-title "$(printf '\033]2;zmx-port-title\007')"
+  sleep 2
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+
+  run cat "$BATS_TEST_TMPDIR/titles.jsonl"
+  [[ "$output" == *'{"title":"zmx-port-title"}'* ]]
+}
+
+@test "list: a title watcher is not counted as a client" {
+  "$ZMX" run t-count -d --initial-command /bin/sh -c 'printf "count-marker\n"; exec /bin/sh'
+  wait_for_session t-count
+  wait_for_output t-count "count-marker"
+
+  run "$ZMX" list
+  local before="$output"
+  [[ "$before" == *"clients=0"* ]]
+
+  "$ZMX" watch-title t-count > /dev/null &
+  local watcher=$!
+  sleep 0.5
+
+  run "$ZMX" list
+  [[ "$output" == *"clients=0"* ]]
+
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+}
+
 @test "run: blocking returns after command completes" {
   run timeout 5 env SHELL=/bin/bash "$ZMX" run test-blocking echo hello
   [ "$status" -eq 0 ]
