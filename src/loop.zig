@@ -284,7 +284,7 @@ pub fn clientLoop(client_sock_fd: i32, prompt_editor_capabilities: u8) !ClientRe
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_fd: lib_posix.socket_t, pty_fd: i32) !void {
-    std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
+    std.log.info("daemon started session=<redacted> pty_fd={d}", .{pty_fd});
 
     try signal.openSignalPipe();
     signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
@@ -702,7 +702,7 @@ pub const Daemon = struct {
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
-        std.log.info("shutting down daemon session={s}", .{self.session_name});
+        std.log.info("shutting down daemon session=<redacted>", .{});
         self.running = false;
 
         for (self.clients.items) |client| {
@@ -717,8 +717,8 @@ pub const Daemon = struct {
         // leader is disconnected, remove ref and let another client claim leader on input
         if (self.leader_client_fd == client.socket_fd) {
             std.log.info(
-                "unsetting leader session={s} fd={d}",
-                .{ self.session_name, client.socket_fd },
+                "unsetting leader session=<redacted> fd={d}",
+                .{client.socket_fd},
             );
             self.leader_client_fd = null;
         }
@@ -747,7 +747,7 @@ pub const Daemon = struct {
     /// the daemon stopped and needs to exit.
     pub fn ensureSession(self: *Daemon, io: std.Io) !bool {
         const sesh_name = self.session_name;
-        std.log.info("ensure session session={s}", .{sesh_name});
+        std.log.info("ensure session session=<redacted>", .{});
         var dir = try std.Io.Dir.openDirAbsolute(io, self.cfg.socket_dir, .{});
         defer dir.close(io);
 
@@ -760,8 +760,8 @@ pub const Daemon = struct {
                 lib_posix.close(fd);
                 if (self.command != null) {
                     std.log.warn(
-                        "session already exists, ignoring command session={s}",
-                        .{sesh_name},
+                        "session already exists, ignoring command session=<redacted>",
+                        .{},
                     );
                 }
             } else |err| switch (err) {
@@ -775,8 +775,8 @@ pub const Daemon = struct {
                 // to attach rather than fail or orphan.
                 else => {
                     std.log.warn(
-                        "connect failed ({s}), proceeding to attach session={s}",
-                        .{ @errorName(err), sesh_name },
+                        "connect failed ({s}), proceeding to attach session=<redacted>",
+                        .{@errorName(err)},
                     );
                 },
             }
@@ -801,15 +801,15 @@ pub const Daemon = struct {
         // `cwd_path` is the decoded path, and is empty when the cwd is on
         // another host: OSC 7 crosses SSH boundaries, so a session that ssh'd
         // elsewhere reports a directory that does not exist on this machine.
-        std.log.info("checking pwd={s} path={s}", .{ self.cwd, self.cwd_path });
+        std.log.info("checking pwd=<redacted> has_local_path={}", .{self.cwd_path.len > 0});
         if (self.cwd_path.len > 0) {
             const pwd_dir = std.Io.Dir.openDirAbsolute(io, self.cwd_path, .{}) catch |err| blk: {
-                std.log.warn("failed to open dir={s} err={s}", .{ self.cwd_path, @errorName(err) });
+                std.log.warn("failed to open session dir=<redacted> err={s}", .{@errorName(err)});
                 break :blk null;
             };
             if (pwd_dir) |pdir| {
                 defer std.Io.Dir.close(pdir, io);
-                std.log.info("set directory dir={s}", .{self.cwd_path});
+                std.log.info("set directory dir=<redacted>", .{});
                 try std.process.setCurrentDir(io, pdir);
             }
         }
@@ -849,13 +849,18 @@ pub const Daemon = struct {
         defer threaded.deinit();
         const new_io = threaded.io();
 
-        { // re-initialize logs with the session name as the filename
+        { // re-initialize logs under a name that does not leak the session
+            // CDXC:ZmxDiagnosticsPrivacy 2026-05-31-00:18:
+            // Users must be able to zip and send zmx log directories without
+            // exposing session names. Use the daemon process id in the
+            // per-session log filename so support can still correlate
+            // child-daemon logs without leaking the user-provided label.
             log.log_system.deinit();
             var log_buf: [4096]u8 = undefined;
             const session_log_name = try std.fmt.bufPrint(
                 &log_buf,
-                "{s}.log",
-                .{sesh_name},
+                "zmx-daemon-{d}.log",
+                .{std.c.getpid()},
             );
             var fba_buf: [4096]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
@@ -884,7 +889,7 @@ pub const Daemon = struct {
             // for the same name issued in that window will hang waiting
             // for a connect.
             lib_posix.close(server_sock_fd);
-            std.log.info("deleting socket file session={s}", .{sesh_name});
+            std.log.info("deleting socket file session=<redacted>", .{});
             dir.deleteFile(new_io, sesh_name) catch |err| {
                 std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
             };
@@ -1259,7 +1264,7 @@ pub const Daemon = struct {
     }
 
     pub fn handleDetach(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize) void {
-        std.log.info("client detach session={s} fd={d}", .{ self.session_name, client.socket_fd });
+        std.log.info("client detach session=<redacted> fd={d}", .{client.socket_fd});
         _ = self.closeClient(gpa, client, i, false);
     }
 
@@ -1273,13 +1278,13 @@ pub const Daemon = struct {
     }
 
     pub fn handleKill(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
-        std.log.info("kill received session={s}", .{self.session_name});
+        std.log.info("kill received session=<redacted>", .{});
         self.shutdown(gpa);
         // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP
         // instead
         //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
         // negative pid means kill process and children
-        std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
+        std.log.info("sending SIGHUP session=<redacted> pid={d}", .{self.pid});
         lib_posix.kill(-self.pid, lib_posix.SIG.HUP) catch |err| {
             std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
         };
@@ -1421,7 +1426,7 @@ pub const Daemon = struct {
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
         const hostname = std.posix.gethostname(&host_buf) catch "";
         const cwd = util.parseOsc7Cwd(&buf, value, hostname) orelse {
-            std.log.warn("ignoring unusable cwd={s}", .{value});
+            std.log.warn("ignoring unusable cwd=<redacted>", .{});
             return;
         };
 
@@ -1444,7 +1449,7 @@ pub const Daemon = struct {
         } else {
             self.cwd_path = "";
         }
-        std.log.info("set cwd={s} path={s}", .{ self.cwd, self.cwd_path });
+        std.log.info("set cwd=<redacted> has_local_path={}", .{self.cwd_path.len > 0});
     }
 
     fn setPwd(self: *Daemon, term: *ghostty_vt.Terminal) void {
@@ -1513,8 +1518,8 @@ pub const Daemon = struct {
         client.has_pending_output = true;
         self.has_had_client = true;
         std.log.debug(
-            "write command len={d} file_path={s}",
-            .{ file_content.len, file_path },
+            "write command len={d} file_path=<redacted>",
+            .{file_content.len},
         );
     }
 
@@ -1526,7 +1531,7 @@ pub const Daemon = struct {
     }
 
     fn handleLabelSet(self: *Daemon, gpa: std.mem.Allocator, client: *Client, labels: []const u8) !void {
-        std.log.info("handle label set payload={s}", .{labels});
+        std.log.info("handle label set payload_len={d}", .{labels.len});
 
         var kvs = label.LabelIterator.init(labels);
         while (kvs.next()) |kv| {

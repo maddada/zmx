@@ -72,7 +72,7 @@ fn exec(sesh_name: []const u8, cmd: Cmd) !noreturn {
     }
 
     const err = lib_posix.execvpeZ(cmd.file, cmd.argv_ptr, std.c.environ);
-    std.log.err("execvpe failed: cmd={s} err={s}", .{ cmd.file, @errorName(err) });
+    std.log.err("execvpe failed: cmd=<redacted> err={s}", .{@errorName(err)});
     lib_posix.exit(1);
 }
 
@@ -112,7 +112,7 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
         unreachable; // exec() either execs or exits, never returns ok
     }
     // master pid code path
-    std.log.info("pty spawned session={s} pid={d}", .{ sesh_name, pid });
+    std.log.info("pty spawned session=<redacted> pid={d}", .{pid});
 
     // make pty non-blocking
     const flags = try lib_posix.fcntl(master_fd, lib_posix.F.GETFL, 0);

@@ -476,7 +476,7 @@ pub fn main(init: std.process.Init) !void {
         daemon.is_task_mode = true;
         daemon.setCwd(cwd);
         daemon.shell = shell_env;
-        std.log.info("socket path={s}", .{daemon.socket_path});
+        std.log.info("socket path=<redacted>", .{});
         try writeFile(gpa, io, &daemon, file_path);
     } else {
         return help(io);
@@ -1068,7 +1068,7 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
         std.log.err("ZMX_SESSION env var not found: are you inside a zmx session?", .{});
         return;
     }
-    std.log.info("detach all session={s}", .{session_name});
+    std.log.info("detach all session=<redacted>", .{});
 
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
@@ -1091,7 +1091,7 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
 }
 
 fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, force: bool) !void {
-    std.log.info("kill session={s}", .{session_name});
+    std.log.info("kill session=<redacted>", .{});
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
         error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
         error.OutOfMemory => return err,
@@ -1171,7 +1171,7 @@ fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn
 }
 
 fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8) !void {
-    std.log.info("label get session={s}", .{session_name});
+    std.log.info("label get session=<redacted>", .{});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
         error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
@@ -1228,7 +1228,7 @@ fn assertLabels(io: std.Io, labels: []const u8) void {
 }
 
 fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, labels: []const u8) !void {
-    std.log.info("label set session={s}", .{session_name});
+    std.log.info("label set session=<redacted>", .{});
 
     assertLabels(io, labels);
 
@@ -1244,7 +1244,7 @@ fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
 }
 
 fn labelClear(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8) !void {
-    std.log.info("label clear session={s}", .{session_name});
+    std.log.info("label clear session=<redacted>", .{});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
         error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
@@ -1265,7 +1265,7 @@ fn fetchHistory(
     cfg: *Cfg,
     session_name: []const u8,
 ) ![]const u8 {
-    std.log.info("fetch history session={s}", .{session_name});
+    std.log.info("fetch history session=<redacted>", .{});
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
         error.NameTooLong => {
             socket.printSessionNameTooLong(io, session_name, cfg.socket_dir);
@@ -1324,7 +1324,7 @@ fn fetchHistory(
 }
 
 fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
-    std.log.info("history session={s}", .{session_name});
+    std.log.info("history session=<redacted>", .{});
 
     const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
         error.NameTooLong => return socket.printSessionNameTooLong(io, session_name, cfg.socket_dir),
@@ -1383,7 +1383,7 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
     // we want daemon.session_name because that's the session name the user provided during zmx attach
     // instead of the name of the session they are currently inside of.
     const next_session = daemon.session_name;
-    std.log.info("switch session cur={s} next={s}", .{ current_sesh, next_session });
+    std.log.info("switch session cur=<redacted> next=<redacted>", .{});
 
     const socket_path = socket.getSocketPath(gpa, daemon.cfg.socket_dir, current_sesh) catch |err| switch (err) {
         error.NameTooLong => return socket.printSessionNameTooLong(io, current_sesh, daemon.cfg.socket_dir),
@@ -1527,7 +1527,7 @@ fn attach(
     }
 
     const client_sock = try socket.sessionConnect(daemon.socket_path);
-    std.log.info("attached session={s}", .{daemon.session_name});
+    std.log.info("attached session=<redacted>", .{});
     //  This is typically used with tcsetattr() to modify terminal settings.
     //      - you first get the current settings with tcgetattr()
     //      - modify the desired attributes in the termios structure
@@ -1601,7 +1601,7 @@ fn attach(
                 // Use the cwd from the previous daemon if available (sent by the daemon),
                 // otherwise fall back to the client's original cwd
                 const switch_cwd = looper.cwd orelse daemon.cwd;
-                std.log.info("switching to new session cwd={s}", .{switch_cwd});
+                std.log.info("switching to new session cwd=<redacted>", .{});
                 target_daemon.setCwd(switch_cwd);
                 target_daemon.shell = daemon.shell;
                 return attach(
@@ -1704,7 +1704,7 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
 }
 
 fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
-    std.log.info("send session={s}", .{session_name});
+    std.log.info("send session=<redacted>", .{});
     var buf: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
 
