@@ -1830,20 +1830,39 @@ fn refreshIfStale(
 ///
 /// Prints what the session's current leader client advertised: "monaco",
 /// "code-server", or "editor".
+/// The 500ms budget is deliberate and must stay below the caller's deadline:
+/// Ghostex runs this with a 750ms timeout and falls back to the machine editor
+/// if it does not answer, so a slower probe here would silently become a
+/// fallback rather than an answer.
 fn printPromptEditorCapability(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
-    const payload = try ipc.roundTripForTag(
-        gpa,
-        socket_path,
-        .PromptEditorCapability,
-        "",
-        .PromptEditorCapability,
-    );
-    defer gpa.free(payload);
+    const fd = try socket.sessionConnect(socket_path);
+    defer lib_posix.close(fd);
+
+    try ipc.send(fd, .PromptEditorCapability, "");
+
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const poll_result = lib_posix.poll(&poll_fds, 500) catch return error.Timeout;
+    if (poll_result == 0) return error.Timeout;
+
+    var sb = try ipc.SocketBuffer.init(gpa);
+    defer sb.deinit();
+
+    const n = sb.read(fd) catch return error.ReadFailed;
+    if (n == 0) return error.ConnectionClosed;
 
     var stdout_buffer: [64]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    try stdout_writer.interface.print("{s}\n", .{payload});
-    try stdout_writer.interface.flush();
+    const stdout = &stdout_writer.interface;
+
+    while (sb.next()) |msg| {
+        if (msg.header.tag == .PromptEditorCapability) {
+            try stdout.print("{s}\n", .{msg.payload});
+            try stdout.flush();
+            return;
+        }
+    }
+
+    return error.NoAckReceived;
 }
 
 /// `zmx watch-title <name>`
