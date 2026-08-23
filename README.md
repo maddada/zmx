@@ -34,15 +34,39 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.6.0-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.6.0-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.7.0-macos-x86_64.tar.gz
 
 ### homebrew
 
 ```bash
 brew install neurosnap/tap/zmx
+```
+
+### mise-en-place
+
+```bash
+mise use zmx
+```
+
+### NixOS / nixpkgs
+
+Run immediately without installation:
+
+```sh
+nix run github:NixOS/nixpkgs/nixpkgs-unstable#zmx
+# or build main yourself
+nix run github:neurosnap/zmx
+```
+
+Start a shell with zmx available while it runs:
+
+```sh
+nix shell github:NixOS/nixpkgs/nixpkgs-unstable#zmx
+# or built main yourself
+nix run github:neurosnap/zmx
 ```
 
 ### packages (unofficial)
@@ -56,7 +80,7 @@ brew install neurosnap/tap/zmx
 
 ### src
 
-- Requires zig `v0.15`
+- Requires zig `v0.16`
 - Clone the repo
 - Run build cmd
 
@@ -69,7 +93,7 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 ## usage
 
 > [!IMPORTANT]
-> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`.
+> We recommend closing the terminal window to detach from the session but you can also press `ctrl+\` or run `zmx detach`. If you need `ctrl+\` for something else (e.g. vim's `ctrl+\ ctrl+n` to escape its own `:terminal`), set `ZMX_NO_DETACH_KEY` to disable the shortcut and rely on `zmx detach` or closing the window instead.
 
 Run `zmx help` for more information on usage, with examples.
 
@@ -83,7 +107,11 @@ Commands:
   [p]rint <name> <text...>                 Inject text into session display
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short]                      List active sessions
+  [l]ist|ls [--short|--where k=v]          List active sessions
+  [g]et <name>                             Get session labels
+  set <name> k=v ...                       Set session labels
+  [un]set <name> key ...                   Remove session labels
+  [cl]ear <name>                           Clear all session labels
   [k]ill <name>... [--force]               Kill session and all attached clients
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
@@ -92,6 +120,25 @@ Commands:
   [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
 ```
+
+## nested sessions
+
+Nested sessions are not supported. Inside a session `ZMX_SESSION` is set, and
+`attach` reads it: instead of creating another client it switches the calling
+terminal to the session you named.
+
+That matters when the variable is inherited rather than chosen. A script, build
+tool, or coding agent started inside a session runs with `ZMX_SESSION` set, so
+`zmx attach other` from there moves the terminal somebody was using, and the
+session it was showing is left with no client.
+
+Unset it in anything that attaches on its own behalf:
+
+```bash
+env -u ZMX_SESSION zmx attach other
+```
+
+For non-interactive work prefer `zmx run`, which never switches the caller.
 
 ## shell prompt
 
@@ -225,11 +272,16 @@ Requires [fzf](https://github.com/junegunn/fzf).
 ```bash
 zmx-select() {
   local display
+  local prefix="${ZMX_SESSION_PREFIX:-}"
   display=$(zmx list 2>/dev/null | while IFS=$'\t' read -r name pid clients created dir; do
     name=${name#*name=}
     pid=${pid#*pid=}
     clients=${clients#*clients=}
     dir=${dir#*start_dir=}
+    if [[ -n "$prefix" ]]; then
+      [[ "$name" == "$prefix"* ]] || continue
+      name=${name#"$prefix"}
+    fi
     printf "%-20s  pid:%-8s  clients:%-2s  %s\n" "$name" "$pid" "$clients" "$dir"
   done)
 
@@ -272,6 +324,22 @@ if command -v zmx &> /dev/null && command -v fzf &> /dev/null && [[ -z "$ZMX_SES
 fi
 ```
 
+#### Alternative: gentle hint (server use)
+
+If you use zmx on a shared server and SSH in frequently for quick operations, auto-launching the picker on every connection may be too aggressive. Instead, show a one-line reminder when active sessions exist:
+
+```bash
+if command -v zmx &> /dev/null && [[ -z "$ZMX_SESSION" ]]; then
+  local count
+  count=$(zmx ls --short 2>/dev/null | wc -l)
+  if [[ "$count" -gt 0 ]]; then
+    echo "zmx: $count session(s) active — \`zmx-select\` to attach" >&2
+  fi
+fi
+```
+
+Choose the auto-launch pattern for dedicated dev machines, and the hint pattern for shared servers where you frequently run quick commands.
+
 </details>
 
 ## session prefix
@@ -295,7 +363,8 @@ Instead, this tool specifically focuses on session persistence and defers window
 ## ssh workflow
 
 ### Try it out quickly
-If you'd like to try out `zmx` and `ssh` without fiddling your `ssh` config, make sure to pass the `-t` option to `ssh`.  Here's an example:
+
+If you'd like to try out `zmx` and `ssh` without fiddling your `ssh` config, make sure to pass the `-t` option to `ssh`. Here's an example:
 
 ```bash
 ssh -t dev-box zmx attach default
@@ -378,7 +447,14 @@ This is particularly useful when running `zmx` as a system service with a shared
 
 ## debugging
 
-We store global logs for cli commands in `{socket_dir}/logs/zmx.log`. We store session-specific logs in `{socket_dir}/logs/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
+We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
+
+The log directory is resolved in this order:
+
+1. `ZMX_DIR/logs` if `ZMX_DIR` is set
+1. `XDG_STATE_HOME/zmx/logs` if `XDG_STATE_HOME` is set
+1. `HOME/.local/state/zmx/logs`
+1. `TMPDIR/zmx-$UID` (or `/tmp/zmx-$UID`) as a last resort
 
 ## a smol contract
 
@@ -457,3 +533,4 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [pi-zmx](https://github.com/deevus/pi-zmx) -- [pi](https://pi.dev) extension for zmx.
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
+- [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.

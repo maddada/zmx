@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_zig_zon = @import("build.zig.zon");
 
 const linux_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
@@ -12,20 +13,21 @@ const macos_targets: []const std.Target.Query = &.{
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const is_macos = target.result.os.tag == .macos;
+    // const is_macos = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Version string for release") orelse
-        @as([]const u8, @import("build.zig.zon").version);
+        @as([]const u8, build_zig_zon.version);
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
-    const ghostty_ver = @import("build.zig.zon").dependencies.ghostty.hash;
+    const ghostty_ver = build_zig_zon.dependencies.ghostty.hash;
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     exe_mod.addOptions("build_options", options);
 
@@ -37,6 +39,7 @@ pub fn build(b: *std.Build) void {
         // on PATH" (true even via the CLT stub), which pulls in the iOS SDK at
         // configure time and breaks builds without full Xcode.
         .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
     });
     exe_mod.addImport(
         "ghostty-vt",
@@ -48,11 +51,11 @@ pub fn build(b: *std.Build) void {
         const run_step = b.step("run", "Run the app");
         const exe = b.addExecutable(.{
             .name = "zmx",
-            .use_llvm = true,
-            .use_lld = !is_macos,
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
             .root_module = exe_mod,
         });
-        exe.linkLibC();
+
         b.installArtifact(exe);
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
@@ -67,12 +70,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         const test_dep = b.dependency("ghostty", .{
             .target = target,
             .optimize = optimize,
             .@"emit-lib-vt" = true,
             .@"emit-xcframework" = false,
+            .@"emit-macos-app" = false,
         });
         test_module.addImport(
             "ghostty-vt",
@@ -80,10 +85,10 @@ pub fn build(b: *std.Build) void {
         );
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
-            .use_llvm = true,
-            .use_lld = !is_macos,
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
         });
-        exe_unit_tests.linkLibC();
+
         const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
         test_step.dependOn(&run_exe_unit_tests.step);
     }
@@ -93,11 +98,10 @@ pub fn build(b: *std.Build) void {
         const check = b.step("check", "Check if zmx compiles");
         const exe_check = b.addExecutable(.{
             .name = "zmx",
-            .use_llvm = true,
-            .use_lld = !is_macos,
+            // .use_llvm = true,
+            // .use_lld = !is_macos,
             .root_module = exe_mod,
         });
-        exe_check.linkLibC();
 
         // Finally we add the "check" step which will be detected
         // by ZLS and automatically enable Build-On-Save.
@@ -118,6 +122,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/main.zig"),
                 .target = resolved,
                 .optimize = .ReleaseSafe,
+                .link_libc = true,
             });
             release_mod.addOptions("build_options", options);
 
@@ -126,18 +131,18 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseSafe,
                 .@"emit-lib-vt" = true,
                 .@"emit-xcframework" = false,
+                .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
             }
 
-            const is_local_macos = resolved.result.os.tag == .macos;
+            // const is_local_macos = resolved.result.os.tag == .macos;
             const release_exe = b.addExecutable(.{
                 .name = "zmx",
-                .use_llvm = true,
-                .use_lld = !is_local_macos,
+                // .use_llvm = true,
+                // .use_lld = !is_local_macos,
                 .root_module = release_mod,
             });
-            release_exe.linkLibC();
 
             const os_name = @tagName(release_target.os_tag orelse .linux);
             const arch_name = @tagName(release_target.cpu_arch orelse .x86_64);
@@ -152,7 +157,7 @@ pub fn build(b: *std.Build) void {
 
             const shasum = b.addSystemCommand(&.{"sha256sum"});
             shasum.addFileArg(tarball);
-            const shasum_output = shasum.captureStdOut();
+            const shasum_output = shasum.captureStdOut(.{});
 
             const install_tar = b.addInstallFile(tarball, b.fmt("dist/{s}", .{tarball_name}));
             const install_sha = b.addInstallFile(

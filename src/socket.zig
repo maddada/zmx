@@ -1,12 +1,12 @@
 const std = @import("std");
-const posix = std.posix;
+const lib_posix = @import("posix.zig");
 
 pub fn getSeshPrefix() []const u8 {
-    return std.posix.getenv("ZMX_SESSION_PREFIX") orelse "";
+    return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
 }
 
 pub fn getSeshNameFromEnv() []const u8 {
-    return std.posix.getenv("ZMX_SESSION") orelse "";
+    return lib_posix.getenv("ZMX_SESSION") orelse "";
 }
 
 pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
@@ -28,27 +28,74 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     return full;
 }
 
+pub fn resolveSessionOrEnv(alloc: std.mem.Allocator, io: std.Io, session_name: ?[]const u8) ![]const u8 {
+    const sesh_env = getSeshNameFromEnv();
+    const raw = if (session_name) |name|
+        if (std.mem.eql(u8, name, ".")) blk: {
+            if (sesh_env.len > 0) break :blk sesh_env;
+            var buf: [4096]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &buf);
+            w.interface.print("error: \".\" requires ZMX_SESSION (are you inside a zmx session?)\n", .{}) catch {};
+            w.interface.flush() catch {};
+            return error.SessionNameRequired;
+        } else name
+    else if (sesh_env.len > 0)
+        sesh_env
+    else {
+        return error.SessionNameRequired;
+    };
+    return getSeshName(alloc, raw);
+}
+
+pub const SessionMatch = struct {
+    name: []const u8,
+    is_prefix: bool,
+
+    pub fn matches(self: SessionMatch, session_name: []const u8) bool {
+        if (self.is_prefix) return std.mem.startsWith(u8, session_name, self.name);
+        return std.mem.eql(u8, session_name, self.name);
+    }
+};
+
+pub fn parseSessionArg(alloc: std.mem.Allocator, raw: []const u8) !SessionMatch {
+    if (raw.len > 0 and raw[raw.len - 1] == '*') {
+        const prefix = raw[0 .. raw.len - 1];
+        const name = if (prefix.len == 0 and getSeshPrefix().len == 0)
+            try alloc.dupe(u8, "")
+        else
+            try getSeshName(alloc, prefix);
+        return .{ .name = name, .is_prefix = true };
+    }
+    const name = try getSeshName(alloc, raw);
+    return .{ .name = name, .is_prefix = false };
+}
+
 pub fn sessionConnect(sesh: []const u8) !i32 {
-    var unix_addr = try std.net.Address.initUnix(sesh);
-    const socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(socket_fd);
-    try posix.connect(socket_fd, &unix_addr.any, unix_addr.getOsSockLen());
+    var unix_addr = try lib_posix.initUnix(sesh);
+    const socket_fd = try lib_posix.socket(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM | lib_posix.SOCK.CLOEXEC, 0);
+    errdefer lib_posix.close(socket_fd);
+    try lib_posix.connect(socket_fd, &unix_addr.any, unix_addr.getOsSockLen());
     return socket_fd;
 }
 
-pub fn cleanupStaleSocket(dir: std.fs.Dir, session_name: []const u8) void {
+pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8) void {
     // CDXC:ZmxDiagnosticsPrivacy 2026-05-30-23:59:
-    // zmx can be used outside Ghostex with user-chosen session names, so daemon logs must not persist raw socket/session names. Log lifecycle phases and errors only; Ghostex-owned correlation happens through gxserver project/session IDs.
+    // zmx can be used outside Ghostex with user-chosen session names, so daemon
+    // logs must not persist raw socket/session names. Log lifecycle phases and
+    // errors only; Ghostex-owned correlation happens through gxserver
+    // project/session IDs.
     std.log.warn("stale socket found, cleaning up session=<redacted>", .{});
-    dir.deleteFile(session_name) catch |err| {
+    dir.deleteFile(io, session_name) catch |err| {
         std.log.warn("failed to delete stale socket err={s}", .{@errorName(err)});
     };
 }
 
-pub fn sessionExists(dir: std.fs.Dir, name: []const u8) !bool {
-    const stat = dir.statFile(name) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
+pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
+    const stat = dir.statFile(io, name, std.Io.Dir.StatFileOptions{}) catch |err| {
+        switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        }
     };
     if (stat.kind != .unix_domain_socket) {
         return error.FileNotUnixSocket;
@@ -56,20 +103,20 @@ pub fn sessionExists(dir: std.fs.Dir, name: []const u8) !bool {
     return true;
 }
 
-pub fn createSocket(fname: []const u8) !i32 {
+pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
     // AF.UNIX: Unix domain socket for local IPC with client processes
     // SOCK.STREAM: Reliable, bidirectional communication
     // SOCK.NONBLOCK: Set socket to non-blocking
-    const fd = try posix.socket(
-        posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
+    const fd = try lib_posix.socket(
+        lib_posix.AF.UNIX,
+        lib_posix.SOCK.STREAM | lib_posix.SOCK.NONBLOCK | lib_posix.SOCK.CLOEXEC,
         0,
     );
-    errdefer posix.close(fd);
+    errdefer lib_posix.close(fd);
 
-    var unix_addr = try std.net.Address.initUnix(fname);
-    try posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
-    try posix.listen(fd, 128);
+    var unix_addr = try lib_posix.initUnix(sesh);
+    try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
+    try lib_posix.listen(fd, 128);
     return fd;
 }
 
@@ -77,7 +124,7 @@ pub fn createSocket(fname: []const u8) !i32 {
 /// Derived from the platform's sockaddr_un.path field, minus 1 for the
 /// required null terminator.
 pub const max_socket_path_len: usize = @typeInfo(
-    @TypeOf(@as(posix.sockaddr.un, undefined).path),
+    @TypeOf(@as(lib_posix.sockaddr.un, undefined).path),
 ).array.len - 1;
 
 pub fn getSocketPath(
@@ -95,9 +142,9 @@ pub fn getSocketPath(
     return fname;
 }
 
-pub fn printSessionNameTooLong(session_name: []const u8, socket_dir: []const u8) void {
+pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) void {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.Io.File.stderr().writer(io, &buf);
     if (maxSessionNameLen(socket_dir)) |max_len| {
         w.interface.print(
             "error: session name is too long ({d} bytes, max {d} for socket directory \"{s}\")\n",
@@ -123,7 +170,7 @@ pub fn maxSessionNameLen(socket_dir: []const u8) ?usize {
 
 test "max_socket_path_len matches platform sockaddr_un" {
     const path_field_len = @typeInfo(
-        @TypeOf(@as(posix.sockaddr.un, undefined).path),
+        @TypeOf(@as(lib_posix.sockaddr.un, undefined).path),
     ).array.len;
     try std.testing.expectEqual(path_field_len - 1, max_socket_path_len);
     try std.testing.expect(max_socket_path_len > 0);
@@ -189,4 +236,13 @@ test "getSocketPath boundary: name fills exactly to limit" {
     @memset(name_over_limit, 'b');
 
     try std.testing.expectError(error.NameTooLong, getSocketPath(alloc, dir, name_over_limit));
+}
+
+test "parseSessionArg accepts a wildcard matching all sessions" {
+    const match = try parseSessionArg(std.testing.allocator, "*");
+    defer std.testing.allocator.free(match.name);
+
+    try std.testing.expect(match.is_prefix);
+    try std.testing.expectEqualStrings("", match.name);
+    try std.testing.expect(match.matches("any-session"));
 }

@@ -3,18 +3,20 @@ set -euo pipefail
 
 export ZMX_SESSION_PREFIX="${ZMX_SESSION_PREFIX:-ci.zmx.}"
 EVENT="${PICI_EVENT:-manual}"
+BRANCH="${PICI_BRANCH:-tmp}"
 
 echo "running ci event=${EVENT} session=${ZMX_SESSION_PREFIX}"
 
 zmx run build docker build -t zig-zmx .
-zmx run fmt -d docker run --rm -t zig-zmx:latest zig fmt --check .
-zmx run test -d docker run --rm -t zig-zmx:latest zig build test
-zmx run integration -d docker run --rm -t zig-zmx:latest bats test/*.bats
+zmx run fmt -d docker run --rm -v "$(pwd):/app" -t zig-zmx:latest zig fmt --check .
+zmx run test -d docker run --rm -v "$(pwd):/app" -t zig-zmx:latest zig build test
+zmx run bin -d docker run --rm -v "$(pwd):/app" -t zig-zmx:latest zig build
+zmx run integration -d docker run --rm -v "$(pwd):/app" -t zig-zmx:latest bats --jobs 1 test/*.bats
 zmx wait "*"
 
 zmx run upload-build docker build -t zmx-upload -f Dockerfile.upload .
 
-if [[ $PICI_BRANCH = "main" ]]; then
+if [[ $BRANCH = "main" ]]; then
   zmx run upload docker run --rm \
     -v "$(pwd)/README.md:/app/README.md:ro" \
     -v "$(pwd)/logo.png:/app/logo.png:ro" \
@@ -33,7 +35,7 @@ NEW_VERSION="${PICI_TAG#v}"
 
 zmx run semver sed -i "s/\.version = \"[^\"]*\"/.version = \"$NEW_VERSION\"/" build.zig.zon && cat build.zig.zon
 zmx run update-readme sed -i "s/zmx-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*/zmx-$NEW_VERSION/g" README.md
-zmx run build-release -d docker run --rm -t zig-zmx:latest zig build release
+zmx run build-release -d docker run --rm -v "$(pwd):/app" -t zig-zmx:latest zig build release
 zmx run brew -d bash gen-brew.sh "$NEW_VERSION"
 
 echo "distributing bins"

@@ -4,14 +4,53 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
-## v0.7.0 - 2026-05-29
+### Added
+
+- We now track cwd changes via OSC7
+- Replay window title on attach
+- `ZMX_NO_DETACH_KEY` env var to disable `ctrl+\` keybinding
+- Added `--labels` flag to attach command
+  - e.g. `zmx attach --labels "project=pico env=prod" pico`
+  - e.g. `zmx attach --labels "$(zmx get pico)" pico.sub`
+
+### Fixed
+
+- Clear screen when switching sessions to prevent term state corruption
+- Stray NUL byte in the OSC 7 sequence replayed on attach
+- The OSC 7 cwd is now decoded before the chdir, so a new session can start in a directory whose name needed percent-encoding
+
+### Changed
+
+- Upgraded to zig v0.16
+- `zmx list` replaced `start_dir` with `cwd`
+- Storing 2k lines of scrollback buffer (like tmux) for each session
+- `ZMX_TASK_COMPLETED` task marker now includes a 4ch hex id to ensure no collisions from nested task runs
+  - `ZMX_TASK_COMPLETED:{id}:0`
+
+## v0.7.0 - 2026-07-23
+
+### Added
+
+- Label system for sessions:
+  - `zmx set <name> k=v ...` to attach key=value labels to live sessions
+  - `zmx set <name> key=` to remove a specific label (empty value = delete)
+  - `zmx get <name>` to read labels from a session
+  - `zmx get <name> key` to print a single value
+  - `zmx clear <name>` to remove all labels
+  - `zmx list` now shows labels by default as tab-separated fields
 
 ### Fixed
 
 - `zmx run` will now detect heredocs and add the completion marker to a newline
+- Race between `zmx kill X; zmx run X`
+- Improved claim leader detection
+- `zmx send` no longer claims client leadership or triggers a resize probe
+- Improved `ctrl+\` key detection
+- Support for linux kernel < 4.11 by avoiding statx calls
 
 ### Changed
 
+- *BREAKING* We now store logs inside of `XDG_STATE_DIR`
 - *BREAKING* `zmx run` when creating session it runs `bash` instead of `$SHELL`
   - There are just too many edge cases with tracking exit status in other shells which makes `zmx run` much less useful for task management.
   - This means when using `zmx run` the target shell must have support for `$?` exit code tracking

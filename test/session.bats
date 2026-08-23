@@ -45,12 +45,119 @@ load test_helper
   [[ "$output" == *"session \"t-init\" created"* ]]
 
   wait_for_session t-init
-  sleep 0.3
+  wait_for_output t-init "initial-command-marker"
   run "$ZMX" history t-init
   [ "$status" -eq 0 ]
   [[ "$output" == *"initial-command-marker"* ]]
+  # argv is exec'd, never echoed through the PTY as shell input
   [[ "$output" != *"--initial-command"* ]]
   [[ "$output" != *"/bin/zsh -lic"* ]]
+}
+
+@test "run: initial-command is ignored for an existing session" {
+  "$ZMX" run t-init-exists -d --initial-command /bin/sh -c 'printf "first-marker\n"; exec /bin/sh'
+  wait_for_session t-init-exists
+  wait_for_output t-init-exists "first-marker"
+
+  run "$ZMX" run t-init-exists -d --initial-command /bin/sh -c 'printf "second-marker\n"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"initial command ignored"* ]]
+  [[ "$output" != *"created"* ]]
+
+  run "$ZMX" history t-init-exists
+  [[ "$output" != *"second-marker"* ]]
+}
+
+@test "run: initial-command requires a command argument" {
+  run "$ZMX" run t-init-nocmd -d --initial-command
+  [ "$status" -ne 0 ]
+
+  run "$ZMX" list --short
+  [[ "$output" != *"t-init-nocmd"* ]]
+}
+
+@test "attach --require-existing fails instead of creating a session" {
+  run "$ZMX" attach --require-existing t-missing
+  [ "$status" -ne 0 ]
+
+  run "$ZMX" list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"t-missing"* ]]
+}
+
+@test "refresh-if-stale: skips when the daemon grid already matches" {
+  "$ZMX" run t-refresh -d --initial-command /bin/sh -c 'printf "refresh-marker\n"; exec /bin/sh'
+  wait_for_session t-refresh
+  wait_for_output t-refresh "refresh-marker"
+
+  # The daemon's grid comes from the creating client's terminal size. Ask with
+  # a deliberately different grid: that is stale and must be applied.
+  run "$ZMX" refresh-if-stale t-refresh 41 121
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refresh-if-stale applied"* ]]
+
+  # Asking again with the same grid is now a no-op.
+  run "$ZMX" refresh-if-stale t-refresh 41 121
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"refresh-if-stale skipped"* ]]
+}
+
+@test "refresh-if-stale: requires session, rows, and cols" {
+  run "$ZMX" refresh-if-stale
+  [ "$status" -ne 0 ]
+  run "$ZMX" refresh-if-stale t-refresh-args
+  [ "$status" -ne 0 ]
+  run "$ZMX" refresh-if-stale t-refresh-args 40
+  [ "$status" -ne 0 ]
+}
+
+@test "prompt-editor-capability: reports editor for a non-advertising client" {
+  "$ZMX" run t-cap -d --initial-command /bin/sh -c 'printf "cap-marker\n"; exec /bin/sh'
+  wait_for_session t-cap
+  wait_for_output t-cap "cap-marker"
+
+  run "$ZMX" prompt-editor-capability t-cap
+  [ "$status" -eq 0 ]
+  [[ "$output" == "editor" ]]
+}
+
+@test "watch-title: streams a coalesced title observation as JSON" {
+  "$ZMX" run t-title -d --initial-command /bin/sh -c 'printf "title-marker\n"; exec /bin/sh'
+  wait_for_session t-title
+  wait_for_output t-title "title-marker"
+
+  # watch-title streams until the session dies, so read it in the background
+  # and stop once the coalescer has emitted (1s debounce + margin).
+  "$ZMX" watch-title t-title > "$BATS_TEST_TMPDIR/titles.jsonl" &
+  local watcher=$!
+  sleep 0.3
+  "$ZMX" print t-title "$(printf '\033]2;zmx-port-title\007')"
+  sleep 2
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+
+  run cat "$BATS_TEST_TMPDIR/titles.jsonl"
+  [[ "$output" == *'{"title":"zmx-port-title"}'* ]]
+}
+
+@test "list: a title watcher is not counted as a client" {
+  "$ZMX" run t-count -d --initial-command /bin/sh -c 'printf "count-marker\n"; exec /bin/sh'
+  wait_for_session t-count
+  wait_for_output t-count "count-marker"
+
+  run "$ZMX" list
+  local before="$output"
+  [[ "$before" == *"clients=0"* ]]
+
+  "$ZMX" watch-title t-count > /dev/null &
+  local watcher=$!
+  sleep 0.5
+
+  run "$ZMX" list
+  [[ "$output" == *"clients=0"* ]]
+
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
 }
 
 @test "run: blocking returns after command completes" {
@@ -98,7 +205,7 @@ load test_helper
 @test "send: does not append CR by default" {
   "$ZMX" run test-send-raw -d echo ready
   wait_for_session test-send-raw
-  sleep 0.5
+  wait_for_output test-send-raw ready
 
   # Send text without \r — it should NOT execute as a command
   run "$ZMX" send test-send-raw "partial-text"
@@ -121,12 +228,12 @@ load test_helper
 @test "send: accepts piped stdin" {
   "$ZMX" run test-send-pipe -d echo ready
   wait_for_session test-send-pipe
-  sleep 0.5
+  wait_for_output test-send-pipe ready
 
   run bash -c 'printf "echo piped-marker-xyz789\r" | "$0" send test-send-pipe' "$ZMX"
   [ "$status" -eq 0 ]
 
-  sleep 0.5
+  wait_for_output test-send-pipe piped-marker-xyz789
   run "$ZMX" history test-send-pipe
   [[ "$output" == *"piped-marker-xyz789"* ]]
 }
@@ -212,7 +319,12 @@ load test_helper
   pid=$("$ZMX" list 2>/dev/null | grep test-force | sed 's/.*pid=\([0-9]*\).*/\1/')
   if [[ -n "$pid" ]]; then
     kill -9 "$pid" 2>/dev/null || true
-    sleep 0.5
+    # Wait for the OS to actually reap the process before relying on
+    # --force to see it as dead.
+    for _ in $(seq 1 50); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
   fi
 
   # Regular kill may fail on the dead session; --force cleans up
@@ -243,7 +355,7 @@ load test_helper
 @test "history: captures session output" {
   "$ZMX" run test-hist -d echo "bats-marker-xyzzy"
   wait_for_session test-hist
-  sleep 0.5  # give the command time to produce output
+  wait_for_output test-hist bats-marker-xyzzy
 
   run "$ZMX" history test-hist
   [ "$status" -eq 0 ]
@@ -257,7 +369,7 @@ load test_helper
 @test "wait: returns after session command completes" {
   "$ZMX" run test-wait -d echo done
   wait_for_session test-wait
-  sleep 1  # give the command time to finish
+  wait_for_output test-wait done
 
   # `wait` should return once the command finishes
   run timeout 10 "$ZMX" wait test-wait
@@ -288,12 +400,12 @@ load test_helper
 @test "print: text appears in history" {
   "$ZMX" run test-print-hist -d echo ready
   wait_for_session test-print-hist
-  sleep 0.3
+  wait_for_output test-print-hist ready
 
   # Caller is responsible for newlines; trailing \r\n ensures the text
   # lands on its own line before SIGWINCH triggers a prompt redraw.
   printf "\r\nbats-print-marker-abc123\r\n" | "$ZMX" print test-print-hist
-  sleep 0.3
+  wait_for_output test-print-hist bats-print-marker-abc123
 
   run "$ZMX" history test-print-hist
   [ "$status" -eq 0 ]
@@ -304,3 +416,15 @@ load test_helper
   run "$ZMX" print
   [ "$status" -ne 0 ]
 }
+
+@test "run: long command line does not truncate history when creating session" {
+  local longcmd="echo 1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"
+  run "$ZMX" run test-long-cmd -d "$longcmd"
+  [ "$status" -eq 0 ]
+  wait_for_session test-long-cmd
+  wait_for_output test-long-cmd 12345678901234567890
+  run "$ZMX" history test-long-cmd
+  [[ "$output" != *"<1234567890"* ]]
+  [[ "$output" == *"12345678901234567890"* ]]
+}
+

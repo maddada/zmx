@@ -1,8 +1,10 @@
 const std = @import("std");
-const posix = std.posix;
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
+const cross = @import("cross.zig");
+const label = @import("label.zig");
+const lib_posix = @import("posix.zig");
 const testing = std.testing;
 
 pub const SessionEntry = struct {
@@ -13,6 +15,7 @@ pub const SessionEntry = struct {
     error_name: ?[]const u8,
     cmd: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    labels: ?[]const u8 = null,
     created_at: u64,
     task_ended_at: ?u64,
     task_exit_code: ?u8,
@@ -21,6 +24,7 @@ pub const SessionEntry = struct {
         alloc.free(self.name);
         if (self.cmd) |cmd| alloc.free(cmd);
         if (self.cwd) |cwd| alloc.free(cwd);
+        if (self.labels) |l| alloc.free(l);
     }
 
     pub fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
@@ -30,16 +34,17 @@ pub const SessionEntry = struct {
 
 pub fn get_session_entries(
     alloc: std.mem.Allocator,
+    io: std.Io,
     socket_dir: []const u8,
 ) !std.ArrayList(SessionEntry) {
-    var dir = try std.fs.openDirAbsolute(socket_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{ .iterate = true });
+    defer dir.close(io);
     var iter = dir.iterate();
 
     var sessions = try std.ArrayList(SessionEntry).initCapacity(alloc, 30);
 
-    while (try iter.next()) |entry| {
-        const exists = socket.sessionExists(dir, entry.name) catch continue;
+    while (try iter.next(io)) |entry| {
+        const exists = socket.sessionExists(io, dir, entry.name) catch continue;
         if (exists) {
             const name = try alloc.dupe(u8, entry.name);
             errdefer alloc.free(name);
@@ -60,16 +65,17 @@ pub fn get_session_entries(
                     .created_at = 0,
                     .task_exit_code = 1,
                     .task_ended_at = 0,
+                    .labels = "",
                 });
                 // Only clean up when the daemon is definitively gone. A busy
                 // daemon can miss the probe timeout; deleting its socket
                 // orphans it permanently.
                 if (err == error.ConnectionRefused) {
-                    socket.cleanupStaleSocket(dir, entry.name);
+                    socket.cleanupStaleSocket(io, dir, entry.name);
                 }
                 continue;
             };
-            posix.close(result.fd);
+            defer result.deinit();
 
             // Extract cmd and cwd from the fixed-size arrays. Lengths come
             // off the wire (u16 range), so clamp to the actual array size.
@@ -79,8 +85,14 @@ pub fn get_session_entries(
                 alloc.dupe(u8, result.info.cmd[0..cmd_len]) catch null
             else
                 null;
+
             const cwd: ?[]const u8 = if (cwd_len > 0)
                 alloc.dupe(u8, result.info.cwd[0..cwd_len]) catch null
+            else
+                null;
+
+            const labels = if (result.labels) |lbl|
+                alloc.dupe(u8, lbl) catch null
             else
                 null;
 
@@ -92,6 +104,7 @@ pub fn get_session_entries(
                 .error_name = null,
                 .cmd = cmd,
                 .cwd = cwd,
+                .labels = labels,
                 .created_at = result.info.created_at,
                 .task_ended_at = result.info.task_ended_at,
                 .task_exit_code = result.info.task_exit_code,
@@ -100,6 +113,108 @@ pub fn get_session_entries(
     }
 
     return sessions;
+}
+
+pub const Cwd = struct {
+    /// A filesystem path, percent-decoded, with no scheme or host.
+    path: []const u8,
+    /// True when the OSC 7 host is this machine, so `path` names a directory we
+    /// can actually chdir into. OSC 7 crosses SSH boundaries, so a session that
+    /// ssh'd elsewhere reports a path that does not exist locally.
+    is_local: bool,
+};
+
+/// parseOsc7Cwd turns an OSC 7 value into a path that can be opened.
+///
+/// The value looks like `file://<host><path>` with the path percent-encoded, so
+/// it cannot be handed to `openDirAbsolute` as-is: the escaping is never
+/// decoded and any directory whose name needed it fails to open.
+///
+/// A plain absolute path is accepted and passed through, since a caller may
+/// hand us one directly before the session has reported an OSC 7.
+///
+/// `buf` holds the decoded path, so the result stays valid after the source
+/// value changes. Returns null when the value is not a path we can use.
+pub fn parseOsc7Cwd(buf: []u8, value: []const u8, hostname: []const u8) ?Cwd {
+    if (value.len == 0) return null;
+
+    if (std.fs.path.isAbsolute(value)) {
+        if (value.len > buf.len) return null;
+        @memcpy(buf[0..value.len], value);
+        return .{ .path = buf[0..value.len], .is_local = true };
+    }
+
+    const uri = std.Uri.parse(value) catch return null;
+    // kitty emits kitty-shell-cwd:// from its own shell integration, and
+    // accepts it alongside file:// on the way back in.
+    if (!std.mem.eql(u8, uri.scheme, "file") and
+        !std.mem.eql(u8, uri.scheme, "kitty-shell-cwd")) return null;
+
+    const decoded = uri.path.toRaw(buf) catch return null;
+    if (!std.fs.path.isAbsolute(decoded)) return null;
+    // toRaw returns the input slice when there was nothing to decode, and that
+    // slice is owned by the caller of this fn, so copy it into buf either way.
+    const path = if (decoded.ptr == buf.ptr) decoded else blk: {
+        if (decoded.len > buf.len) return null;
+        std.mem.copyForwards(u8, buf[0..decoded.len], decoded);
+        break :blk buf[0..decoded.len];
+    };
+
+    return .{ .path = path, .is_local = isLocalHost(uri.host, hostname) };
+}
+
+fn isLocalHost(host: ?std.Uri.Component, hostname: []const u8) bool {
+    // file:///path omits the host, which conventionally means the local machine.
+    const component = host orelse return true;
+    var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const value = component.toRaw(&host_buf) catch return false;
+    if (value.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(value, "localhost")) return true;
+    if (std.ascii.eqlIgnoreCase(value, hostname)) return true;
+    // gethostname often reports a short name while OSC 7 carries the FQDN
+    // (or the reverse), so fall back to comparing the first label.
+    const value_label = value[0 .. std.mem.indexOfScalar(u8, value, '.') orelse value.len];
+    const host_label = hostname[0 .. std.mem.indexOfScalar(u8, hostname, '.') orelse hostname.len];
+    return host_label.len > 0 and std.ascii.eqlIgnoreCase(value_label, host_label);
+}
+
+/// toOsc7Cwd renders a plain path as the OSC 7 form, `file://<host><path>`.
+///
+/// The daemon stores its cwd in this form so `zmx list` shows the host, which
+/// is how you can tell at a glance that a session is inside SSH. Callers that
+/// only have a local path (`zmx run`, `zmx attach`) go through this so the
+/// stored value has one shape regardless of where it came from.
+///
+/// Returns null when the result would not fit in `buf`.
+pub fn toOsc7Cwd(buf: []u8, path: []const u8, hostname: []const u8) ?[]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("file://{s}", .{hostname}) catch return null;
+    // Percent-encode so a path with a space or a `%` in it round-trips back
+    // through parseOsc7Cwd unchanged.
+    std.Uri.Component.percentEncode(&w, path, isPathChar) catch return null;
+    return w.buffered();
+}
+
+/// Characters that need no escaping in a URI path. RFC 3986 pchar, minus the
+/// sub-delims that a shell would find surprising to see left raw in `zmx list`.
+fn isPathChar(c: u8) bool {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9' => true,
+        '-', '.', '_', '~', '/', ':', '@' => true,
+        else => false,
+    };
+}
+
+/// getCwd get the current working directory in a std.Uri format.
+/// Caller is responsible for releasing memory.
+pub fn getCwd(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const cur_path = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cur_path);
+
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = try std.posix.gethostname(&buf);
+
+    return std.fmt.allocPrint(gpa, "file://{s}{s}", .{ hostname, cur_path });
 }
 
 pub fn shellNeedsQuoting(arg: []const u8) bool {
@@ -325,11 +440,28 @@ test "rewritePromptRedraw: embedded in larger output" {
     try std.testing.expectEqualStrings("some output\r\n\x1b]133;A;redraw=0\x07prompt$ \x1b]133;B\x07", result);
 }
 
-pub fn findTaskExitMarker(output: []const u8) ?u8 {
-    const marker = "ZMX_TASK_COMPLETED:";
+pub fn generateTaskId(io: std.Io) [4]u8 {
+    var bytes: [2]u8 = undefined;
+    io.random(&bytes);
+    return std.fmt.bytesToHex(bytes, .lower);
+}
 
-    // Search for marker in output
-    if (std.mem.indexOf(u8, output, marker)) |idx| {
+pub fn getTaskExitMarker(buf: []u8, id_marker: [4]u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "ZMX_TASK_COMPLETED:{s}:", .{id_marker});
+}
+
+pub fn findTaskExitMarker(output: []const u8, id_marker: [4]u8) !?u8 {
+    var buf: [1024]u8 = undefined;
+    const marker = try getTaskExitMarker(&buf, id_marker);
+
+    // The command line is echoed back by the PTY (canonical mode) before the
+    // shell evaluates it, so the *first* occurrence of the marker in the
+    // output is often the literal, unexpanded "ZMX_TASK_COMPLETED:{id}:$?" from
+    // the echo, not the real "ZMX_TASK_COMPLETED:{id}:<code>" written once the
+    // shell actually runs it. Keep scanning past unparseable occurrences
+    // instead of giving up on the first one.
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, output, search_start, marker)) |idx| {
         const after_marker = output[idx + marker.len ..];
 
         // Find the exit code number and newline
@@ -344,8 +476,7 @@ pub fn findTaskExitMarker(output: []const u8) ?u8 {
         if (std.fmt.parseInt(u8, exit_code_str, 10)) |exit_code| {
             return exit_code;
         } else |_| {
-            std.log.warn("failed to parse task exit code len={d}", .{exit_code_str.len});
-            return null;
+            search_start = idx + marker.len;
         }
     }
 
@@ -387,10 +518,63 @@ pub fn stripAnsi(alloc: std.mem.Allocator, data: []const u8) ![]const u8 {
     return result.toOwnedSlice(alloc);
 }
 
-/// Detects Kitty keyboard protocol escape sequence for Ctrl+\
+/// Dcts Ctrl+\ across raw, Kitty CSI u, and xterm modifyOtherKeys encodings.
 pub fn isCtrlBackslash(buf: []const u8) bool {
     if (buf.len == 0) return false;
-    return buf[0] == 0x1C or isKeyPressed(buf, 0x5c, 0b100);
+    return buf[0] == 0x1C or isKeyPressed(buf, 0x5c, 0b100) or isModifyOtherKey(buf, 0x5c, 0b100);
+}
+
+/// Scans the buffer for an xterm modifyOtherKeys-encoded keypress.
+/// Format: CSI 27 ; <modifier> ; <keycode> ~
+/// Reference: invisible-island.net/xterm/ctlseqs/ctlseqs.html (modifyOtherKeys).
+fn isModifyOtherKey(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    var i: usize = 0;
+    while (i + 1 < buf.len) : (i += 1) {
+        if (buf[i] == 0x1b and buf[i + 1] == '[') {
+            if (modifyOtherMatches(buf[i + 2 ..], expected_key, expected_mods)) return true;
+        }
+    }
+    return false;
+}
+
+/// Parses the body of an xterm modifyOtherKeys CSI sequence (after the leading
+/// `\x1b[`). Mirrors keypressWithMod's tolerance for lock modifiers.
+fn modifyOtherMatches(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    var pos: usize = 0;
+
+    // 1. Sentinel: literal "27" identifies xterm modifyOtherKeys.
+    const sentinel = parseDecimal(buf, &pos) orelse return false;
+    if (sentinel != 27) return false;
+
+    // 2. Expect ';' before modifier.
+    if (pos >= buf.len or buf[pos] != ';') return false;
+    pos += 1;
+
+    // 3. Parse modifier (xterm encodes as 1 + bitfield, same as kitty).
+    const mod_encoded = parseDecimal(buf, &pos) orelse return false;
+    if (mod_encoded < 1) return false;
+    const mod_raw = mod_encoded - 1;
+    // Tolerate ambient lock modifiers (caps_lock=64, num_lock=128).
+    const intentional_mods = mod_raw & 0b00111111;
+    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
+
+    // 4. Expect ';' before keycode.
+    if (pos >= buf.len or buf[pos] != ';') return false;
+    pos += 1;
+
+    // 5. Parse keycode.
+    const key_code = parseDecimal(buf, &pos) orelse return false;
+    if (key_code != expected_key) return false;
+
+    // 6. Expect '~' terminator.
+    return pos < buf.len and buf[pos] == '~';
+}
+
+/// Returns true when the user has opted out of the ctrl+\ detach shortcut
+/// via ZMX_NO_DETACH_KEY, e.g. to free up ctrl+\ for an inner program
+/// like vim, which uses ctrl+\ ctrl+n to escape its own terminal mode.
+pub fn isDetachKeyDisabled() bool {
+    return lib_posix.getenv("ZMX_NO_DETACH_KEY") != null;
 }
 
 /// Detects vt100 or kitty keyboard protocol escape sequence for up arrow.
@@ -417,11 +601,31 @@ fn isKeyPressed(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
 /// and alternate key sub-fields from the kitty protocol's progressive
 /// enhancement flags.
 fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
+    const parsed = parseKittyCsiU(buf) orelse return false;
+    if (parsed.key_code != expected_key) return false;
+
+    // Only accept intentional modifiers. Lock modifiers
+    // (caps_lock=0b1000000, num_lock=0b10000000) are tolerated because
+    // they are ambient state, not deliberate key combinations.
+    const intentional_mods = parsed.modifiers & 0b00111111;
+    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
+
+    // 3 = release -- reject. Accept press (1) and repeat (2).
+    return parsed.event_type != 3;
+}
+
+const KittyCsiU = struct {
+    key_code: u32,
+    modifiers: u32,
+    event_type: u32,
+    consumed: usize,
+};
+
+fn parseKittyCsiU(buf: []const u8) ?KittyCsiU {
     var pos: usize = 0;
 
     // 1. Parse key code.
-    const key_code = parseDecimal(buf, &pos) orelse return false;
-    if (key_code != expected_key) return false;
+    const key_code = parseDecimal(buf, &pos) orelse return null;
 
     // 2. Skip any ':alternate-key' sub-fields (shifted key, base layout key).
     while (pos < buf.len and buf[pos] == ':') {
@@ -430,29 +634,22 @@ fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool 
     }
 
     // 3. Expect ';' separator before modifiers.
-    if (pos >= buf.len or buf[pos] != ';') return false;
+    if (pos >= buf.len or buf[pos] != ';') return null;
     pos += 1;
 
     // 4. Parse modifier value. Kitty encodes as 1 + bitfield.
-    const mod_encoded = parseDecimal(buf, &pos) orelse return false;
-    if (mod_encoded < 1) return false;
+    const mod_encoded = parseDecimal(buf, &pos) orelse return null;
+    if (mod_encoded < 1) return null;
     const mod_raw = mod_encoded - 1;
 
-    // 5. Only accept intentional modifiers. Lock modifiers
-    //    (caps_lock=0b1000000, num_lock=0b10000000) are tolerated because
-    //    they are ambient state, not deliberate key combinations.
-    const intentional_mods = mod_raw & 0b00111111;
-    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
-
-    // 6. Parse optional event type after ':'.
+    var event_type: u32 = 1;
+    // 5. Parse optional event type after ':'.
     if (pos < buf.len and buf[pos] == ':') {
         pos += 1;
-        const event_type = parseDecimal(buf, &pos) orelse return false;
-        // 3 = release -- reject. Accept press (1) and repeat (2).
-        if (event_type == 3) return false;
+        event_type = parseDecimal(buf, &pos) orelse return null;
     }
 
-    // 7. Skip optional ';text-codepoints' section.
+    // 6. Skip optional ';text-codepoints' section.
     if (pos < buf.len and buf[pos] == ';') {
         pos += 1;
         // Consume remaining digits and colons until 'u'.
@@ -461,8 +658,16 @@ fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool 
         }
     }
 
-    // 8. Expect terminal 'u'.
-    return pos < buf.len and buf[pos] == 'u';
+    // 7. Expect terminal 'u'.
+    if (pos >= buf.len or buf[pos] != 'u') return null;
+    pos += 1;
+
+    return .{
+        .key_code = key_code,
+        .modifiers = mod_raw,
+        .event_type = event_type,
+        .consumed = pos,
+    };
 }
 
 /// Parse a decimal integer from buf starting at pos, advancing pos past the
@@ -482,8 +687,17 @@ fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
 /// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
 pub fn isUserInput(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
-    for (payload) |c| {
-        const actions = parser.next(c);
+    var i: usize = 0;
+    while (i < payload.len) {
+        if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
+            if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
+                if (kitty.event_type != 3) return true;
+                i += 2 + kitty.consumed;
+                continue;
+            }
+        }
+
+        const actions = parser.next(payload[i]);
         for (actions) |action_opt| {
             const action = action_opt orelse continue;
             switch (action) {
@@ -511,8 +725,47 @@ pub fn isUserInput(payload: []const u8) bool {
                 else => {},
             }
         }
+        i += 1;
     }
     return false;
+}
+
+/// Emit the terminal's pwd as OSC 7.
+///
+/// This replaces the formatter's own `extra.pwd`, which writes
+/// `terminal.pwd.items` verbatim. `Terminal.setPwd` appends a NUL sentinel to
+/// that buffer, so the formatter's OSC 7 carries a stray `\x00` before the
+/// terminator. `getPwd()` returns the same bytes without the sentinel.
+///
+/// The NUL is not cosmetic: a client that records what it receives (kitty
+/// writing its session file, for one) persists the NUL and then fails to parse
+/// its own state back. See https://github.com/neurosnap/zmx/issues/222.
+fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+    const pwd = term.getPwd() orelse return;
+    if (pwd.len == 0) return;
+    writer.print("\x1b]7;{s}\x1b\\", .{pwd}) catch |err| {
+        std.log.warn("failed to format pwd err={s}", .{@errorName(err)});
+    };
+}
+
+fn writeDynamicColor(
+    writer: *std.Io.Writer,
+    kind: ghostty_vt.color.Dynamic,
+    dynamic: ghostty_vt.color.DynamicRGB,
+) void {
+    const c = dynamic.override orelse return;
+    writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
+        @intFromEnum(kind), c.r, c.g, c.b,
+    }) catch |err| {
+        std.log.warn("failed to format dynamic color err={s}", .{@errorName(err)});
+    };
+}
+
+fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
+    const colors = &term.colors;
+    writeDynamicColor(writer, .foreground, colors.foreground);
+    writeDynamicColor(writer, .background, colors.background);
+    writeDynamicColor(writer, .cursor, colors.cursor);
 }
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
@@ -528,6 +781,9 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+
+    // If state contains color override, restore it.
+    writeColorOverrides(&builder.writer, term);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -600,7 +856,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         .modes = true,
         .scrolling_region = true,
         .tabstops = false, // tabstop restoration moves cursor after CUP, corrupting position
-        .pwd = true,
+        .pwd = false, // emitted below without the sentinel the formatter includes
         .keyboard = true,
         .screen = .all,
     };
@@ -609,6 +865,18 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
         return null;
     };
+
+    writePwd(&builder.writer, term);
+
+    // The formatter has no title extra and never emits OSC 0/1/2, so the title
+    // has to be replayed separately or an attaching client shows whatever its
+    // terminal defaults to, usually the client process name. OSC 2 does not
+    // move the cursor, so this is safe to append after the content.
+    if (term.getTitle()) |title| {
+        builder.writer.print("\x1b]2;{s}\x07", .{title}) catch |err| {
+            std.log.warn("failed to format title err={s}", .{@errorName(err)});
+        };
+    }
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
@@ -624,11 +892,20 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     };
 }
 
+/// Serialize only the active viewport, as a clear-and-repaint snapshot.
+///
+/// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex can ask an already attached
+/// zmx client to repaint a stale visible pane. Refresh output must not include
+/// scrollback because the client already owns that history; emit only a
+/// clear-and-repaint snapshot of the active viewport so no bytes reach the PTY
+/// and no scrollback is duplicated.
 pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
-    // CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex can ask an already attached zmx client to repaint a stale visible pane. Refresh output must not include scrollback because the client already owns that history; emit only a clear-and-repaint snapshot of the active viewport so no bytes reach the PTY and no scrollback is duplicated.
+    // Same rationale as serializeTerminalState: synchronized output (DECSET
+    // 2026) is a handshake with the *current* client, so replaying it would
+    // make the repainted client defer rendering until its own timeout fires.
     const had_synchronized_output = term.modes.get(.synchronized_output);
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
@@ -663,7 +940,7 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
         .modes = true,
         .scrolling_region = true,
         .tabstops = false,
-        .pwd = true,
+        .pwd = false, // emitted below without the sentinel the formatter includes
         .keyboard = true,
         .screen = .all,
     };
@@ -672,6 +949,8 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
         std.log.warn("failed to format visible terminal state err={s}", .{@errorName(err)});
         return null;
     };
+
+    writePwd(&builder.writer, term);
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
@@ -710,7 +989,7 @@ pub fn serializeTerminal(
             .modes = true,
             .scrolling_region = true,
             .tabstops = false,
-            .pwd = true,
+            .pwd = false, // emitted below without the sentinel the formatter includes
             .keyboard = true,
             .screen = .all,
         },
@@ -722,6 +1001,8 @@ pub fn serializeTerminal(
         return null;
     };
 
+    if (format == .vt) writePwd(&builder.writer, term);
+
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
 
@@ -729,10 +1010,6 @@ pub fn serializeTerminal(
         std.log.warn("failed to allocate terminal output err={s}", .{@errorName(err)});
         return null;
     };
-}
-
-pub fn detectShell() [:0]const u8 {
-    return std.posix.getenv("SHELL") orelse "/bin/sh";
 }
 
 /// Formats a session entry for list output (only the name when `short` is
@@ -780,7 +1057,7 @@ pub fn writeSessionLine(
         session.created_at,
     });
     if (session.cwd) |cwd| {
-        try writer.print("\tstart_dir={s}", .{cwd});
+        try writer.print("\tcwd={s}", .{cwd});
     }
     if (session.cmd) |cmd| {
         try writer.print("\tcmd={s}", .{cmd});
@@ -792,6 +1069,12 @@ pub fn writeSessionLine(
             if (session.task_exit_code) |exit_code| {
                 try writer.print("\texit_code={d}", .{exit_code});
             }
+        }
+    }
+    if (session.labels) |labels| {
+        var kvs = label.LabelIterator.init(labels);
+        while (kvs.next()) |kv| {
+            try writer.print("\t{s}={s}", .{ kv.key, kv.value });
         }
     }
     try writer.print("\n", .{});
@@ -1065,10 +1348,283 @@ test "isCtrlBackslash" {
     try expect(!isCtrlBackslash("\x1b[65;92u"));
 }
 
+test "isCtrlBackslash xterm modifyOtherKeys" {
+    const expect = std.testing.expect;
+
+    // Basic: ctrl only (modifier 5 = 1 + 4), key 92 = '\'
+    // Format: CSI 27 ; <mod> ; <key> ~
+    try expect(isCtrlBackslash("\x1b[27;5;92~"));
+
+    // Lock modifiers tolerated
+    // ctrl + caps_lock = 1 + (4 + 64) = 69
+    try expect(isCtrlBackslash("\x1b[27;69;92~"));
+    // ctrl + num_lock = 1 + (4 + 128) = 133
+    try expect(isCtrlBackslash("\x1b[27;133;92~"));
+    // ctrl + caps_lock + num_lock = 1 + (4 + 64 + 128) = 197
+    try expect(isCtrlBackslash("\x1b[27;197;92~"));
+
+    // Combined intentional modifiers must NOT match
+    // ctrl + shift = 1 + (4 + 1) = 6
+    try expect(!isCtrlBackslash("\x1b[27;6;92~"));
+    // ctrl + alt = 1 + (4 + 2) = 7
+    try expect(!isCtrlBackslash("\x1b[27;7;92~"));
+    // ctrl + super = 1 + (4 + 8) = 13
+    try expect(!isCtrlBackslash("\x1b[27;13;92~"));
+    // ctrl + shift + caps_lock = 1 + (1 + 4 + 64) = 70 -- shift is intentional
+    try expect(!isCtrlBackslash("\x1b[27;70;92~"));
+    // ctrl + shift + num_lock = 1 + (1 + 4 + 128) = 134 -- shift is intentional
+    try expect(!isCtrlBackslash("\x1b[27;134;92~"));
+
+    // Modifier without ctrl bit -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;1;92~"));
+    try expect(!isCtrlBackslash("\x1b[27;2;92~"));
+
+    // Wrong key code -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;5;91~"));
+    try expect(!isCtrlBackslash("\x1b[27;5;93~"));
+    try expect(!isCtrlBackslash("\x1b[27;5;65~"));
+
+    // Wrong sentinel -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[28;5;92~"));
+    try expect(!isCtrlBackslash("\x1b[26;5;92~"));
+
+    // Wrong terminator -- must NOT match
+    try expect(!isCtrlBackslash("\x1b[27;5;92u"));
+    try expect(!isCtrlBackslash("\x1b[27;5;92m"));
+
+    // CSI sequences that look similar but are not modifyOtherKeys
+    try expect(!isCtrlBackslash("\x1b[27m")); // SGR reset reverse
+    try expect(!isCtrlBackslash("\x1b[27~")); // xterm F4
+    try expect(!isCtrlBackslash("\x1b[27;5R")); // truncated cursor report
+
+    // Sequence embedded in larger buffer
+    try expect(isCtrlBackslash("abc\x1b[27;5;92~"));
+    try expect(isCtrlBackslash("\x1b[A\x1b[27;5;92~"));
+
+    // Garbage / malformed
+    try expect(!isCtrlBackslash("\x1b[27"));
+    try expect(!isCtrlBackslash("\x1b[27;"));
+    try expect(!isCtrlBackslash("\x1b[27;5"));
+    try expect(!isCtrlBackslash("\x1b[27;5;"));
+    try expect(!isCtrlBackslash("\x1b[27;5;92"));
+}
+
+test "isDetachKeyDisabled" {
+    _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(!isDetachKeyDisabled());
+
+    _ = cross.c.setenv("ZMX_NO_DETACH_KEY", "1", 1);
+    defer _ = cross.c.unsetenv("ZMX_NO_DETACH_KEY");
+    try testing.expect(isDetachKeyDisabled());
+}
+
+test "parseOsc7Cwd" {
+    const Case = struct {
+        name: []const u8,
+        value: []const u8,
+        hostname: []const u8,
+        expected: ?Cwd,
+    };
+
+    const cases = [_]Case{
+        .{
+            .name = "local file uri",
+            .value = "file://myhost/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "percent-encoded path is decoded",
+            .value = "file://myhost/tmp/zmx%20spaced%20dir",
+            .hostname = "myhost",
+            .expected = .{ .path = "/tmp/zmx spaced dir", .is_local = true },
+        },
+        .{
+            .name = "kitty scheme",
+            .value = "kitty-shell-cwd://myhost/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "remote host keeps the path but is not local",
+            .value = "file://otherhost/home/me",
+            .hostname = "myhost",
+            .expected = .{ .path = "/home/me", .is_local = false },
+        },
+        .{
+            .name = "empty host means local",
+            .value = "file:///private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "localhost means local",
+            .value = "file://localhost/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "fqdn matches a short hostname",
+            .value = "file://myhost.local/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "short host matches an fqdn hostname",
+            .value = "file://myhost/private/tmp",
+            .hostname = "myhost.lan",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "host comparison ignores case",
+            .value = "file://MyHost/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "plain absolute path passes through",
+            .value = "/private/tmp",
+            .hostname = "myhost",
+            .expected = .{ .path = "/private/tmp", .is_local = true },
+        },
+        .{
+            .name = "empty value",
+            .value = "",
+            .hostname = "myhost",
+            .expected = null,
+        },
+        .{
+            .name = "relative path",
+            .value = "some/dir",
+            .hostname = "myhost",
+            .expected = null,
+        },
+        .{
+            .name = "unsupported scheme",
+            .value = "http://myhost/private/tmp",
+            .hostname = "myhost",
+            .expected = null,
+        },
+        .{
+            .name = "uri without a path",
+            .value = "file://myhost",
+            .hostname = "myhost",
+            .expected = null,
+        },
+    };
+
+    for (cases) |c| {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const actual = parseOsc7Cwd(&buf, c.value, c.hostname);
+        testing.expectEqualDeep(c.expected, actual) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
+test "parseOsc7Cwd result survives the source value changing" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var value: [32]u8 = undefined;
+    const src = "file://myhost/private/tmp";
+    @memcpy(value[0..src.len], src);
+
+    const cwd = parseOsc7Cwd(&buf, value[0..src.len], "myhost") orelse
+        return error.TestUnexpectedNull;
+
+    @memset(&value, 'x');
+    try testing.expectEqualDeep(Cwd{ .path = "/private/tmp", .is_local = true }, cwd);
+}
+
+test "parseOsc7Cwd rejects a path longer than the buffer" {
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(
+        @as(?Cwd, null),
+        parseOsc7Cwd(&buf, "file://myhost/a/very/long/path", "myhost"),
+    );
+    try testing.expectEqual(
+        @as(?Cwd, null),
+        parseOsc7Cwd(&buf, "/a/very/long/path", "myhost"),
+    );
+}
+
+test "toOsc7Cwd" {
+    const Case = struct {
+        name: []const u8,
+        path: []const u8,
+        expected: ?[]const u8,
+    };
+
+    const cases = [_]Case{
+        .{
+            .name = "plain path",
+            .path = "/private/tmp",
+            .expected = "file://myhost/private/tmp",
+        },
+        .{
+            .name = "space is encoded",
+            .path = "/tmp/zmx spaced dir",
+            .expected = "file://myhost/tmp/zmx%20spaced%20dir",
+        },
+        .{
+            .name = "percent is encoded so it round-trips",
+            .path = "/tmp/100%",
+            .expected = "file://myhost/tmp/100%25",
+        },
+        .{
+            .name = "unreserved characters are left alone",
+            .path = "/tmp/a-b_c.d~e",
+            .expected = "file://myhost/tmp/a-b_c.d~e",
+        },
+    };
+
+    for (cases) |c| {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        testing.expectEqualDeep(c.expected, toOsc7Cwd(&buf, c.path, "myhost")) catch |err| {
+            std.debug.print("case: {s}\n", .{c.name});
+            return err;
+        };
+    }
+}
+
+test "toOsc7Cwd returns null when the result would not fit" {
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(
+        @as(?[]const u8, null),
+        toOsc7Cwd(&buf, "/a/very/long/path", "myhost"),
+    );
+}
+
+test "toOsc7Cwd round-trips through parseOsc7Cwd" {
+    const paths = [_][]const u8{
+        "/private/tmp",
+        "/tmp/zmx spaced dir",
+        "/tmp/100%",
+        "/tmp/a-b_c.d~e",
+        "/tmp/quote'and\"dquote",
+    };
+
+    for (paths) |path| {
+        var enc_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const uri = toOsc7Cwd(&enc_buf, path, "myhost") orelse
+            return error.TestUnexpectedNull;
+
+        var dec_buf: [std.fs.max_path_bytes]u8 = undefined;
+        testing.expectEqualDeep(
+            Cwd{ .path = path, .is_local = true },
+            parseOsc7Cwd(&dec_buf, uri, "myhost"),
+        ) catch |err| {
+            std.debug.print("path: {s} uri: {s}\n", .{ path, uri });
+            return err;
+        };
+    }
+}
+
 test "serializeTerminalState excludes synchronized output replay" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try ghostty_vt.Terminal.init(alloc, .{
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
     });
@@ -1093,11 +1649,121 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2026h") == null);
 }
 
-fn testCreateTerminal(alloc: std.mem.Allocator, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {
-    var term = try ghostty_vt.Terminal.init(alloc, .{
+test "serializeTerminalState replays the title" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]2;my title\x07");
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;my title\x07") != null);
+}
+
+test "serializeTerminalState omits the title when none is set" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]2;") == null);
+}
+
+test "serializeTerminalState replays the pwd without a NUL sentinel" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]7;file://myhost/private/tmp\x1b\\");
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;file://myhost/private/tmp\x1b\\") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, output, 0));
+}
+
+test "serializeTerminalState omits the pwd when none is set" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("hello");
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;") == null);
+}
+
+test "serializeTerminal vt replays the pwd without a NUL sentinel" {
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b]7;file://myhost/private/tmp\x1b\\");
+    stream.nextSlice("hello");
+
+    const output = serializeTerminal(alloc, &term, .vt) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b]7;file://myhost/private/tmp\x1b\\") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, output, 0));
+}
+
+fn testCreateTerminal(alloc: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, vt_data: []const u8) !ghostty_vt.Terminal {
+    var term = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     if (vt_data.len > 0) {
         var stream = term.vtStream();
@@ -1121,15 +1787,15 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
     try testing.expectEqual(row, cursor.y);
 }
 
-fn serializeRoundtrip(alloc: std.mem.Allocator, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
+fn serializeRoundtrip(alloc: std.mem.Allocator, io: std.Io, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
     const serialized = serializeTerminalState(alloc, source) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
-    var dest = try ghostty_vt.Terminal.init(alloc, .{
+    var dest = try ghostty_vt.Terminal.init(io, alloc, .{
         .cols = source.screens.active.pages.cols,
         .rows = source.screens.active.pages.rows,
-        .max_scrollback = 10_000_000,
+        .max_scrollback_lines = 2_000,
     });
     var stream = dest.vtStream();
     defer stream.deinit();
@@ -1155,15 +1821,16 @@ fn expectMarkerAtRow(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, marke
 
 test "serializeTerminalState roundtrip preserves cursor position" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[2J" ++ // clear
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[2J" ++ // clear
         "\x1b[10;20H" // cursor at row 10, col 20 (1-indexed)
     );
     defer term.deinit(alloc);
 
     try expectCursorAt(&term, 9, 19); // 0-indexed
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectCursorAt(&client, 9, 19);
@@ -1171,8 +1838,9 @@ test "serializeTerminalState roundtrip preserves cursor position" {
 
 test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[2J" ++
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[2J" ++
         "\x1b[2;5HMARK_A" ++
         "\x1b[6;15HMARK_B" ++
         "\x1b[10;30HMARK_C" ++
@@ -1180,7 +1848,7 @@ test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
         "\x1b[16;20H");
     defer term.deinit(alloc);
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1193,8 +1861,9 @@ test "serializeTerminalState roundtrip preserves CUP-positioned markers" {
 
 test "serializeTerminalState with scrollback preserves visible content" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "");
+    var term = try testCreateTerminal(alloc, io, 80, 24, "");
     defer term.deinit(alloc);
 
     var stream = term.vtStream();
@@ -1220,7 +1889,7 @@ test "serializeTerminalState with scrollback preserves visible content" {
     try testing.expect(has_scrollback);
 
     // Roundtrip: serialize → feed into fresh terminal
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     // Visible content must match (this is the core cursor corruption test)
@@ -1235,9 +1904,10 @@ test "serializeTerminalState nested roundtrip preserves content" {
     // Simulates: inner zmx → serialized state → outer ghostty-vt → serialized again → client
     // This is the exact nested session scenario (zmx → SSH → zmx).
     const alloc = testing.allocator;
+    const io = testing.io;
 
     // "Inner" terminal with scrollback + markers
-    var inner = try testCreateTerminal(alloc, 80, 24, "");
+    var inner = try testCreateTerminal(alloc, io, 80, 24, "");
     defer inner.deinit(alloc);
 
     {
@@ -1264,7 +1934,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     defer alloc.free(inner_serialized);
 
     // "Outer" terminal processes inner's serialized output
-    var outer = try testCreateTerminal(alloc, 80, 24, "");
+    var outer = try testCreateTerminal(alloc, io, 80, 24, "");
     defer outer.deinit(alloc);
 
     {
@@ -1274,7 +1944,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     }
 
     // Serialize outer (simulates outer daemon re-attach after detach)
-    var client = try serializeRoundtrip(alloc, &outer);
+    var client = try serializeRoundtrip(alloc, io, &outer);
     defer client.deinit(alloc);
 
     // Client must see the same content as inner's visible screen
@@ -1286,15 +1956,16 @@ test "serializeTerminalState nested roundtrip preserves content" {
 
 test "serializeTerminalState alternate screen not leaked" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 24, "\x1b[?1049h" ++ // enter alt screen
+    var term = try testCreateTerminal(alloc, io, 80, 24, "\x1b[?1049h" ++ // enter alt screen
         "\x1b[2J\x1b[3;10HALT_MARK" ++ // write on alt screen
         "\x1b[?1049l" ++ // exit alt screen
         "\x1b[2J\x1b[2;5HMAIN_MARK\x1b[8;20H" // write on main screen
     );
     defer term.deinit(alloc);
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1307,8 +1978,9 @@ test "serializeTerminalState alternate screen not leaked" {
 
 test "serializeTerminalState size mismatch roundtrip" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var term = try testCreateTerminal(alloc, 80, 30, "\x1b[2J" ++
+    var term = try testCreateTerminal(alloc, io, 80, 30, "\x1b[2J" ++
         "\x1b[3;10HSIZE_A" ++
         "\x1b[12;20HSIZE_B" ++
         "\x1b[20;40HSIZE_C" ++
@@ -1316,9 +1988,9 @@ test "serializeTerminalState size mismatch roundtrip" {
     defer term.deinit(alloc);
 
     // Resize to 24 rows (simulates outer terminal being smaller)
-    try term.resize(alloc, 80, 24);
+    try term.resize(alloc, ghostty_vt.Terminal.Resize{ .cols = 80, .rows = 24 });
 
-    var client = try serializeRoundtrip(alloc, &term);
+    var client = try serializeRoundtrip(alloc, io, &term);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &term, &client);
@@ -1327,8 +1999,9 @@ test "serializeTerminalState size mismatch roundtrip" {
 
 test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const alloc = testing.allocator;
+    const io = testing.io;
 
-    var inner = try testCreateTerminal(alloc, 80, 30, "");
+    var inner = try testCreateTerminal(alloc, io, 80, 30, "");
     defer inner.deinit(alloc);
 
     {
@@ -1346,7 +2019,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     }
 
     // Resize inner to 24 rows (outer terminal is smaller)
-    try inner.resize(alloc, 80, 24);
+    try inner.resize(alloc, ghostty_vt.Terminal.Resize{ .cols = 80, .rows = 24 });
 
     const inner_cursor_x = inner.screens.active.cursor.x;
     const inner_cursor_y = inner.screens.active.cursor.y;
@@ -1356,7 +2029,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 
-    var outer = try testCreateTerminal(alloc, 80, 24, "");
+    var outer = try testCreateTerminal(alloc, io, 80, 24, "");
     defer outer.deinit(alloc);
     {
         var outer_stream = outer.vtStream();
@@ -1364,7 +2037,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
         outer_stream.nextSlice(inner_ser);
     }
 
-    var client = try serializeRoundtrip(alloc, &outer);
+    var client = try serializeRoundtrip(alloc, io, &outer);
     defer client.deinit(alloc);
 
     try expectScreensMatch(alloc, &inner, &client);
@@ -1485,6 +2158,10 @@ test "isUserInput: kitty keyboard sequences" {
     // Kitty keyboard protocol uses CSI u
     try testing.expect(isUserInput("\x1b[11;2u")); // F1 with modifier
     try testing.expect(isUserInput("\x1b[12;2u")); // F2 with modifier
+    try testing.expect(isUserInput("\x1b[102;1:1u")); // literal "f" press
+    try testing.expect(isUserInput("\x1b[57444;1:1u")); // Kitty functional key press
+    try testing.expect(!isUserInput("\x1b[102;1:3u")); // literal "f" release only
+    try testing.expect(isUserInput("\x1b[102;1:1u\x1b[67;65;31M")); // key press with mouse noise
 }
 
 test "isUserInput: mouse events (CSI M) excluded" {
