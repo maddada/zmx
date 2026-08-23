@@ -23,6 +23,16 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    // === Ghostex fork tags ===
+    // Upstream owns 0-18. The fork's five tags used to live at 14-18 and were
+    // renumbered to 19-23 when upstream claimed 14-18 for labels and Send.
+    // This is a deliberate wire break against pre-renumber Ghostex daemons:
+    // they must be cycled, not upgraded in place.
+    Refresh = 19,
+    TitleSubscribe = 20,
+    TitleObserved = 21,
+    RefreshIfStale = 22,
+    PromptEditorCapability = 23,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -321,6 +331,14 @@ test "Tag wire values are frozen" {
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },
+    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "Ghostex fork Tag wire values are frozen" {
+    inline for (.{
+        .{ Tag.Refresh, 19 },        .{ Tag.TitleSubscribe, 20 },
+        .{ Tag.TitleObserved, 21 },  .{ Tag.RefreshIfStale, 22 },
+        .{ Tag.PromptEditorCapability, 23 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
