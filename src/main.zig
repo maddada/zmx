@@ -1705,8 +1705,13 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
 
 fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, socket_path: []const u8, text_parts: [][]const u8, tag: ipc.Tag) !void {
     std.log.info("send session=<redacted>", .{});
+    // Failures here are reported on stderr, not stdout: gxserver surfaces the
+    // child's stderr as the error string, and a message printed to stdout
+    // alongside a zero exit is exactly how undelivered text used to look
+    // like a successful send.
     var buf: [4096]u8 = undefined;
-    var w = std.Io.File.stdout().writer(io, &buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &buf);
+    const w = &stderr_writer.interface;
 
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(alloc);
@@ -1743,26 +1748,87 @@ fn send(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const probe_result = ipc.probeSession(alloc, socket_path) catch |err| {
-        std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        if (err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(io, dir, session_name);
-            try w.interface.print("cleaned up stale session {s}\n", .{session_name});
-        } else {
-            try w.interface.print(
-                "session {s} is unresponsive ({s})\ndaemon may be busy: try again\n",
-                .{ session_name, @errorName(err) },
-            );
-        }
-        try w.interface.flush();
-        return;
-    };
+    if (tag == .Send) {
+        return sendToPty(alloc, io, dir, session_name, socket_path, payload.items, w);
+    }
+
+    const probe_result = ipc.probeSession(alloc, socket_path) catch |err|
+        failUndelivered(io, dir, session_name, err, w);
     defer probe_result.deinit();
 
-    ipc.send(probe_result.fd, tag, payload.items) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.BrokenPipe => return,
-        else => return err,
-    };
+    ipc.send(probe_result.fd, tag, payload.items) catch |err|
+        failUndelivered(io, dir, session_name, err, w);
+}
+
+/// Deadline for the daemon's `.SendAcked` receipt. gxserver kills the wrapper
+/// shell at `ZMX_LIFECYCLE_COMMAND_TIMEOUT_MS` (5s, server/src/zmx/types.rs),
+/// so stay well under it: a SIGTERM'd zmx cannot explain itself.
+const SEND_ACK_TIMEOUT_MS: i64 = 3000;
+
+/// `zmx send`: hand the payload to the daemon and only exit 0 once the daemon
+/// says it queued the bytes for the pty.
+///
+/// gxserver reads a zero exit as "the agent received this text". Before the
+/// receipt existed, an unresponsive daemon, a reset connection, or a dropped
+/// payload all still exited 0, so lost prompts looked delivered.
+fn sendToPty(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    session_name: []const u8,
+    socket_path: []const u8,
+    payload: []const u8,
+    w: *std.Io.Writer,
+) void {
+    const outcome = ipc.sendToSessionPty(alloc, io, socket_path, payload, SEND_ACK_TIMEOUT_MS) catch |err|
+        failUndelivered(io, dir, session_name, err, w);
+
+    switch (outcome) {
+        // Daemon predates `.SendAcked`; it took the payload under the legacy
+        // `.Send` tag, which carries no receipt to check.
+        .legacy_unconfirmed => {},
+        .acked => |status| {
+            const reason: []const u8 = switch (status) {
+                .queued => return,
+                .dropped_pty_buffer_full => "the program in the session stopped reading its input",
+                .dropped_out_of_memory => "the session daemon ran out of memory",
+                _ => "the session daemon reported an unknown delivery status",
+            };
+            std.log.err("send dropped by daemon status={d}", .{@intFromEnum(status)});
+            w.print(
+                "session {s} dropped the text: {s}\n",
+                .{ session_name, reason },
+            ) catch {};
+            w.flush() catch {};
+            std.process.exit(1);
+        },
+    }
+}
+
+/// The payload never reached the session's daemon. Say so on stderr and fail,
+/// because the caller's only delivery signal is this process's exit code.
+fn failUndelivered(
+    io: std.Io,
+    dir: std.Io.Dir,
+    session_name: []const u8,
+    err: anyerror,
+    w: *std.Io.Writer,
+) noreturn {
+    std.log.err("send failed: {s}", .{@errorName(err)});
+    if (err == error.ConnectionRefused) {
+        socket.cleanupStaleSocket(io, dir, session_name);
+        w.print(
+            "session {s} is gone; cleaned up its stale socket, text was not delivered\n",
+            .{session_name},
+        ) catch {};
+    } else {
+        w.print(
+            "session {s} is unresponsive ({s}); text was not delivered\n",
+            .{ session_name, @errorName(err) },
+        ) catch {};
+    }
+    w.flush() catch {};
+    std.process.exit(1);
 }
 
 /// `zmx refresh-if-stale <name> <rows> <cols>`

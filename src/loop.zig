@@ -480,7 +480,17 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             while (daemon.pty_write_buf.items.len > 0) {
                 const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
                     if (err != error.WouldBlock) {
-                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
+                        // Everything still queued for the pty is thrown away
+                        // here, which silently eats already-acked `.Send` /
+                        // `.SendAcked` payloads. Log it as an error with the
+                        // byte count so the loss is attributable. Session
+                        // names stay out of daemon logs on purpose
+                        // (CDXC:ZmxDiagnosticsPrivacy); the log file is named
+                        // after this daemon's pid, which identifies it.
+                        std.log.err(
+                            "pty write failed: {s}; dropped {d} unflushed pty input bytes session=<redacted>",
+                            .{ @errorName(err), daemon.pty_write_buf.items.len },
+                        );
                         daemon.pty_write_buf.clearRetainingCapacity();
                     }
                     break;
@@ -529,6 +539,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
+                        .SendAcked => try daemon.handleSendAcked(gpa, client, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
@@ -554,7 +565,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .RefreshIfStale => try daemon.handleRefreshIfStale(gpa, client, pty_fd, &term, msg.payload),
                         .PromptEditorCapability => try daemon.handlePromptEditorCapability(gpa, client),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
-                        .Ack, .TaskComplete, .LabelData, .TitleObserved => {},
+                        // Daemon -> client tags. A client never sends these.
+                        .Ack, .TaskComplete, .LabelData, .TitleObserved, .SendAck => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -921,13 +933,23 @@ pub const Daemon = struct {
     /// threshold. Capping avoids OOM when the shell stops reading; dropping
     /// new (not old) bytes avoids tearing a partially-accepted sequence.
     fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
-        if (data.len == 0) return;
+        _ = self.queuePtyInputChecked(gpa, data);
+    }
+
+    /// Same as `queuePtyInput`, but reports the outcome so `.SendAcked`
+    /// senders learn about a drop instead of it living only in this log.
+    fn queuePtyInputChecked(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        data: []const u8,
+    ) ipc.SendAckStatus {
+        if (data.len == 0) return .queued;
         if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
             std.log.warn(
                 "pty input dropped {d} bytes (buffer full, shell not reading)",
                 .{data.len},
             );
-            return;
+            return .dropped_pty_buffer_full;
         }
 
         // NOTE: for local dev only
@@ -938,7 +960,9 @@ pub const Daemon = struct {
                 "pty input dropped {d} bytes: {s}",
                 .{ data.len, @errorName(err) },
             );
+            return .dropped_out_of_memory;
         };
+        return .queued;
     }
 
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
@@ -961,6 +985,32 @@ pub const Daemon = struct {
     /// Queue input from `zmx send` without changing interactive client leadership.
     pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) void {
         self.queuePtyInput(gpa, payload);
+    }
+
+    /// `.SendAcked` is `.Send` plus a receipt.
+    ///
+    /// Ghostex's gxserver treats a zero exit from `zmx send` as proof the
+    /// agent received the text, so whether the payload made it into the pty
+    /// queue has to travel back to the sender. The receipt covers the
+    /// enqueue only; the final pty flush happens later in the poll loop.
+    ///
+    /// An empty payload is the client's capability ping: it queues nothing
+    /// and still acks, which is how a new client learns this daemon
+    /// understands the tag before it commits a real payload to it.
+    pub fn handleSendAcked(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        payload: []const u8,
+    ) !void {
+        const status = self.queuePtyInputChecked(gpa, payload);
+        try ipc.appendMessage(
+            gpa,
+            &client.write_buf,
+            .SendAck,
+            &[_]u8{@intFromEnum(status)},
+        );
+        client.has_pending_output = true;
     }
 
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {

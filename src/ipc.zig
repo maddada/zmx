@@ -33,6 +33,20 @@ pub const Tag = enum(u8) {
     TitleObserved = 21,
     RefreshIfStale = 22,
     PromptEditorCapability = 23,
+    /// Like `Send`, but the daemon answers with `SendAck` once it has decided
+    /// what to do with the payload. Added 2026-08-24 so `zmx send` can stop
+    /// reporting success for bytes that never reached the pty queue.
+    ///
+    /// COMPATIBILITY: daemons predating this tag fall into the dispatcher's
+    /// `_` arm, which logs and drops the message without desyncing the
+    /// stream (the header is length-prefixed) and without closing the
+    /// connection. That is exactly why `sendToSessionPty` pings with an
+    /// EMPTY `SendAcked` first and only commits the real payload to this tag
+    /// after a `SendAck` proves the daemon understands it.
+    SendAcked = 24,
+    /// Daemon -> client receipt for `SendAcked`. Payload is one byte holding
+    /// a `SendAckStatus`.
+    SendAck = 25,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -309,6 +323,128 @@ pub fn probeSession(
     return error.Unexpected;
 }
 
+/// What the daemon did with a `SendAcked` payload. Wire value: one byte.
+pub const SendAckStatus = enum(u8) {
+    /// Appended to the pty input buffer. The poll loop flushes it.
+    queued = 0,
+    /// Dropped: the pty input buffer is at `PTY_WRITE_BUF_MAX` because the
+    /// program on the other end stopped reading.
+    dropped_pty_buffer_full = 1,
+    /// Dropped: the daemon could not grow its pty input buffer.
+    dropped_out_of_memory = 2,
+    // Non-exhaustive for the same reason `Tag` is: it comes off the wire.
+    _,
+};
+
+pub const SendDeliveryError = error{
+    Timeout,
+    ConnectionRefused,
+    ConnectionLost,
+    Unexpected,
+};
+
+pub const SendDelivery = union(enum) {
+    /// The daemon reported what it did with the payload.
+    acked: SendAckStatus,
+    /// The daemon predates `Tag.SendAcked`, so the payload went out under the
+    /// legacy `Tag.Send` and nothing confirms it reached the pty queue.
+    legacy_unconfirmed,
+};
+
+/// How long to wait for the daemon's answer to the capability ping. Same
+/// budget `probeSession` gives a liveness probe.
+const SEND_PROBE_TIMEOUT_MS: i64 = 1000;
+
+/// Reads framed messages off `fd` until `wanted` arrives or `timeout_ms`
+/// elapses, discarding anything else (an unattached client still receives
+/// `Output` broadcasts). Returns a slice into `sb`, valid until the next
+/// read on it.
+fn awaitMessage(
+    io: std.Io,
+    fd: i32,
+    sb: *SocketBuffer,
+    wanted: Tag,
+    timeout_ms: i64,
+    saw_send_ack: ?*bool,
+    ack_status: ?*u8,
+) SendDeliveryError![]const u8 {
+    var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+    const started = std.Io.Timestamp.now(io, .awake);
+    while (true) {
+        // Drain everything already framed before touching the socket again.
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .SendAck) {
+                if (saw_send_ack) |flag| flag.* = true;
+                if (ack_status) |slot| slot.* = if (msg.payload.len > 0) msg.payload[0] else 0;
+            }
+            if (msg.header.tag == wanted) return msg.payload;
+        }
+
+        const elapsed = started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+        const remaining = timeout_ms - elapsed;
+        if (remaining <= 0) return error.Timeout;
+
+        const ready = lib_posix.poll(&poll_fds, @intCast(remaining)) catch return error.Unexpected;
+        if (ready == 0) return error.Timeout;
+        const n = sb.read(fd) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return error.ConnectionLost,
+        };
+        // EOF: the daemon closed the connection without answering.
+        if (n == 0) return error.ConnectionLost;
+    }
+}
+
+/// Hand `payload` to a session's pty and find out whether it landed.
+///
+/// Ghostex's gxserver treats a zero exit from `zmx send` as proof the agent
+/// received the text, so "the write went into a socket" is not good enough:
+/// the daemon has to say it queued the bytes.
+///
+/// Capability detection costs no extra round trip. Requests are answered in
+/// the order the daemon reads them, so an EMPTY `SendAcked` ping followed by
+/// `Info` on the same connection is self-describing: a daemon that knows the
+/// tag answers `SendAck` *before* `Info`, and an `Info` reply with no
+/// `SendAck` in front of it proves the daemon is older and must be fed the
+/// legacy `Send` tag. The ping itself is harmless either way -- an empty
+/// payload queues nothing, and an old daemon just logs an unknown tag.
+pub fn sendToSessionPty(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    socket_path: []const u8,
+    payload: []const u8,
+    ack_timeout_ms: i64,
+) SendDeliveryError!SendDelivery {
+    const fd = try connectSession(socket_path);
+    defer lib_posix.close(fd);
+
+    try sendRequest(fd, .SendAcked, "");
+    try sendRequest(fd, .Info, "");
+
+    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    defer sb.deinit();
+
+    var supports_ack = false;
+    _ = try awaitMessage(io, fd, &sb, .Info, SEND_PROBE_TIMEOUT_MS, &supports_ack, null);
+
+    if (!supports_ack) {
+        try sendRequest(fd, .Send, payload);
+        return .legacy_unconfirmed;
+    }
+
+    try sendRequest(fd, .SendAcked, payload);
+    var status_byte: u8 = @intFromEnum(SendAckStatus.queued);
+    _ = try awaitMessage(io, fd, &sb, .SendAck, ack_timeout_ms, null, &status_byte);
+    return .{ .acked = @enumFromInt(status_byte) };
+}
+
+fn sendRequest(fd: i32, tag: Tag, data: []const u8) SendDeliveryError!void {
+    send(fd, tag, data) catch |err| switch (err) {
+        error.BrokenPipe, error.ConnectionResetByPeer => return error.ConnectionLost,
+        else => return error.Unexpected,
+    };
+}
+
 //  WIRE PROTOCOL FREEZE: read before "fixing" any test below.
 //
 //  Changing these constants does not fix the test; it breaks every
@@ -339,6 +475,7 @@ test "Ghostex fork Tag wire values are frozen" {
         .{ Tag.Refresh, 19 },        .{ Tag.TitleSubscribe, 20 },
         .{ Tag.TitleObserved, 21 },  .{ Tag.RefreshIfStale, 22 },
         .{ Tag.PromptEditorCapability, 23 },
+        .{ Tag.SendAcked, 24 },      .{ Tag.SendAck, 25 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
