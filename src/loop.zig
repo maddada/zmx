@@ -710,7 +710,11 @@ pub const Daemon = struct {
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         self.title_coalescer.deinit(gpa);
-        gpa.free(self.socket_path);
+        // socket_path is NOT freed here: init()'s contract says the caller
+        // owns everything passed into it, and in the daemon process it is a
+        // PRE-fork allocation that must never be freed post-fork (see the
+        // CDXC:ZmxForkChildMallocExit comment in run()). The client process
+        // frees it via its own defer at the attach call site in main.zig.
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -895,25 +899,45 @@ pub const Daemon = struct {
             break :blk std.heap.c_allocator;
         };
 
-        defer {
-            // Close and unlink the listen socket BEFORE handleKill()'s
-            // 500ms SIGHUP->SIGKILL grace sleep. Otherwise a `zmx run`
-            // for the same name issued in that window will hang waiting
-            // for a connect.
-            lib_posix.close(server_sock_fd);
-            std.log.info("deleting socket file session=<redacted>", .{});
-            dir.deleteFile(new_io, sesh_name) catch |err| {
-                std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
-            };
-            self.handleKill(gpa, new_io);
-            self.deinit(gpa);
-            lib_posix.close(pty_info.master_fd);
-            _ = lib_posix.waitpid(self.pid, 0);
-        }
+        var daemon_exit_status: u8 = 0;
+        daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd) catch |err| {
+            std.log.err("daemon loop failed err={s}", .{@errorName(err)});
+            daemon_exit_status = 1;
+        };
+        if (daemon_exit_status == 0) std.log.info("daemon loop shutdown", .{});
 
-        try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
-        std.log.info("daemon loop shutdown", .{});
-        return true;
+        // Close and unlink the listen socket BEFORE handleKill()'s
+        // 500ms SIGHUP->SIGKILL grace sleep. Otherwise a `zmx run`
+        // for the same name issued in that window will hang waiting
+        // for a connect.
+        lib_posix.close(server_sock_fd);
+        std.log.info("deleting socket file session=<redacted>", .{});
+        dir.deleteFile(new_io, sesh_name) catch |err| {
+            std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+        };
+        self.handleKill(gpa, new_io);
+        self.deinit(gpa);
+        lib_posix.close(pty_info.master_fd);
+        _ = lib_posix.waitpid(self.pid, 0);
+
+        // CDXC:ZmxForkChildMallocExit 2026-08-30:
+        // The daemon process is the child of daemonize()'s fork and never
+        // execs. Zig 0.16's std.process.Init starts a std.Io.Threaded pool
+        // before main(), so the client is multi-threaded when it forks, and on
+        // macOS 26+ libmalloc therefore keeps the child on its fork-safe
+        // fallback allocator (mfm_*) for the child's entire life: the pre-fork
+        // xzone heap may have been forked mid-mutation, so free() of any
+        // PRE-fork allocation aborts with "BUG IN CLIENT OF LIBMALLOC: not an
+        // allocated block". Returning from here would unwind into exactly such
+        // frees (main()'s defers on sesh/log_path/cfg and std.start's
+        // environ/arena teardown), which SIGTRAP'd the daemon on every single
+        // `zmx kill` (156+ crash reports in two days). Post-fork allocations
+        // (clients, labels, buffers — everything deinit() still frees above)
+        // are fork-child-owned and safe. Pre-fork memory is reclaimed by
+        // process exit, so the daemon must leave via exit() and never unwind
+        // past this function. The `return true` "is daemon proc" contract this
+        // replaces only told callers to unwind straight out anyway.
+        lib_posix.exit(daemon_exit_status);
     }
 
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {

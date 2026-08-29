@@ -156,6 +156,11 @@ pub fn main(init: std.process.Init) !void {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
+        // Freed here (client process only): Daemon.deinit deliberately does
+        // not free socket_path, and the daemon process exits inside run()
+        // without ever unwinding back to this defer. See
+        // CDXC:ZmxForkChildMallocExit in loop.zig.
+        defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.command = command;
         daemon.setCwd(cwd);
@@ -472,6 +477,7 @@ pub fn main(init: std.process.Init) !void {
             error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
             error.OutOfMemory => return err,
         };
+        defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.is_task_mode = true;
         daemon.setCwd(cwd);
@@ -1597,6 +1603,7 @@ fn attach(
                     error.OutOfMemory => return err,
                 };
 
+                defer gpa.free(target_path);
                 var target_daemon = Daemon.init(io, daemon.cfg, session_name, target_path);
                 // Use the cwd from the previous daemon if available (sent by the daemon),
                 // otherwise fall back to the client's original cwd
