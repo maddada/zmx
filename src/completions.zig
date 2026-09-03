@@ -32,7 +32,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print refresh-if-stale watch-title prompt-editor-capability write detach list kill history get set clear wait tail completions version help"
+    \\  local commands="attach run send print refresh-if-stale grid watch-title prompt-editor-capability write detach list kill history get set clear wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -40,7 +40,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|refresh-if-stale|watch-title|prompt-editor-capability|write|kill|history|get|set|clear|wait|tail)
+    \\    attach|run|send|print|refresh-if-stale|grid|watch-title|prompt-editor-capability|write|kill|history|get|set|clear|wait|tail)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -79,6 +79,7 @@ const zsh_completions =
     \\        'send:Send raw input to session PTY'
     \\        'print:Inject text into session display'
     \\        'refresh-if-stale:Repaint clients only when the daemon grid differs'
+    \\        'grid:Print the daemon grid and client leadership as JSON'
     \\        'watch-title:Stream coalesced terminal title observations'
     \\        'prompt-editor-capability:Print leader client prompt-editor support'
     \\        'write:Write stdin to file_path through the session'
@@ -99,7 +100,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|send|s|print|p|refresh-if-stale|watch-title|prompt-editor-capability|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
+    \\        attach|a|kill|k|run|r|send|s|print|p|refresh-if-stale|grid|watch-title|prompt-editor-capability|write|wr|history|get|g|set|clear|hi|wait|w|tail|t)
     \\          _zmx_sessions
     \\          ;;
     \\        completions|c)
@@ -143,6 +144,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a send -d 'Send raw input to session PTY'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a print -d 'Inject text into session display'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a refresh-if-stale -d 'Repaint clients only when the daemon grid differs'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a grid -d 'Print the daemon grid and client leadership as JSON'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a watch-title -d 'Stream coalesced terminal title observations'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a prompt-editor-capability -d 'Print leader client prompt-editor support'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a write -d 'Write stdin to file_path through the session'
@@ -160,7 +162,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
     \\# Complete session names and shells
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print refresh-if-stale watch-title prompt-editor-capability wr write hi history g get se set cl clear" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send p print refresh-if-stale grid watch-title prompt-editor-capability wr write hi history g get se set cl clear" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\complete -c zmx -n "not __fish_is_nth_token 1; and __fish_seen_subcommand_from k kill w wait t tail" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu' -d Shell
@@ -230,6 +232,7 @@ const nu_completions =
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx tail" [...sessions: string@"nu-complete zmx sessions"]
     \\export extern "zmx watch-title" [name: string@"nu-complete zmx sessions"]
+    \\export extern "zmx grid" [name: string@"nu-complete zmx sessions"]
     \\export extern "zmx prompt-editor-capability" [name?: string@"nu-complete zmx sessions"]
     \\
     \\export extern "zmx refresh-if-stale" [

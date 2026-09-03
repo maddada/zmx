@@ -23,14 +23,60 @@ pub const prompt_editor_capability_code_server: u8 = 2;
 /// it into a Refresh IPC so the shell/PTY never receives the control bytes.
 pub const ghostex_refresh_sequence = "\x1b]1337;ZMX_REFRESH\x07";
 
+/// CDXC:ZmxGridVisibility 2026-09-03: every Ghostex private OSC shares this
+/// prefix. The body between the prefix and the BEL terminator selects the IPC:
+///   REFRESH               -> `.Refresh`
+///   VISIBLE=<rows>,<cols> -> `.Visibility{ hidden = 0, resize = rows x cols }`
+///   HIDDEN=<rows>,<cols>  -> `.Visibility{ hidden = 1, resize = rows x cols }`
+/// `<rows>` and `<cols>` are decimal u16, both > 0. A terminated sequence with
+/// any other body (unknown name, missing comma, zero, overflow, junk) is
+/// consumed and dropped: the ZMX_ namespace is ours, so its control bytes are
+/// never forwarded to the PTY. A prefix without a BEL in the same read is
+/// forwarded untouched, matching the pre-existing REFRESH behaviour, which
+/// also never reassembled a sequence split across two stdin reads.
+pub const ghostex_osc_prefix = "\x1b]1337;ZMX_";
+pub const ghostex_visible_body_prefix = "VISIBLE=";
+pub const ghostex_hidden_body_prefix = "HIDDEN=";
+const ghostex_refresh_body = "REFRESH";
+const osc_bel: u8 = 0x07;
+
 fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
+}
+
+const GhostexOscMessage = union(enum) {
+    refresh,
+    visibility: ipc.Visibility,
+    /// Terminated but not a message we understand: consume silently.
+    malformed,
+};
+
+/// Parse "<rows>,<cols>" as two decimal u16 values, both non-zero.
+fn parseRowsCols(body: []const u8) ?ipc.Resize {
+    const comma = std.mem.indexOfScalar(u8, body, ',') orelse return null;
+    const rows = std.fmt.parseInt(u16, body[0..comma], 10) catch return null;
+    const cols = std.fmt.parseInt(u16, body[comma + 1 ..], 10) catch return null;
+    if (rows == 0 or cols == 0) return null;
+    return .{ .rows = rows, .cols = cols };
+}
+
+fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
+    if (std.mem.eql(u8, body, ghostex_refresh_body)) return .refresh;
+    if (std.mem.startsWith(u8, body, ghostex_visible_body_prefix)) {
+        const resize = parseRowsCols(body[ghostex_visible_body_prefix.len..]) orelse return .malformed;
+        return .{ .visibility = .{ .hidden = false, .resize = resize } };
+    }
+    if (std.mem.startsWith(u8, body, ghostex_hidden_body_prefix)) {
+        const resize = parseRowsCols(body[ghostex_hidden_body_prefix.len..]) orelse return .malformed;
+        return .{ .visibility = .{ .hidden = true, .resize = resize } };
+    }
+    return .malformed;
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
 /// Split raw client stdin into IPC messages, converting Ghostex's private
-/// refresh OSC into a Refresh IPC instead of forwarding it to the PTY.
+/// OSCs (refresh, visible, hidden) into IPC instead of forwarding them to the PTY.
 ///
 /// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex sends a private OSC refresh
 /// request through the attached terminal because that path is already connected
@@ -38,12 +84,25 @@ fn nowMs(io: std.Io) i64 {
 /// convert it to Refresh IPC so the shell/PTY never receives the control bytes.
 fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
     var remaining = input;
-    while (std.mem.indexOf(u8, remaining, ghostex_refresh_sequence)) |index| {
+    while (std.mem.indexOf(u8, remaining, ghostex_osc_prefix)) |index| {
+        const tail = remaining[index..];
+        // No terminator in this read: forward the rest verbatim, as the
+        // REFRESH-only implementation did.
+        const bel = std.mem.indexOfScalar(u8, tail, osc_bel) orelse break;
         if (index > 0) {
             try ipc.appendMessage(gpa, sock_write_buf, .Input, remaining[0..index]);
         }
-        try ipc.appendMessage(gpa, sock_write_buf, .Refresh, "");
-        remaining = remaining[index + ghostex_refresh_sequence.len ..];
+        switch (parseGhostexOscBody(tail[ghostex_osc_prefix.len..bel])) {
+            .refresh => try ipc.appendMessage(gpa, sock_write_buf, .Refresh, ""),
+            .visibility => |visibility| try ipc.appendMessage(
+                gpa,
+                sock_write_buf,
+                .Visibility,
+                &visibility.encode(),
+            ),
+            .malformed => std.log.warn("dropping malformed Ghostex OSC len={d}", .{bel + 1}),
+        }
+        remaining = tail[bel + 1 ..];
     }
     if (remaining.len > 0) {
         try ipc.appendMessage(gpa, sock_write_buf, .Input, remaining);
@@ -300,6 +359,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     defer term.deinit(gpa);
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
+    daemon.pty_fd = pty_fd;
+    daemon.term = &term;
+    defer daemon.term = null;
 
     // Carries the tail of the previous PTY read so the task-exit marker
     // search below can see across a read() boundary. Sized to comfortably
@@ -564,6 +626,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Refresh => try daemon.handleRefresh(gpa, client, &term),
                         .RefreshIfStale => try daemon.handleRefreshIfStale(gpa, client, pty_fd, &term, msg.payload),
                         .PromptEditorCapability => try daemon.handlePromptEditorCapability(gpa, client),
+                        .Visibility => try daemon.handleVisibility(gpa, client, msg.payload),
+                        .GridInfo => try daemon.handleGridInfo(gpa, client, &term),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
                         // Daemon -> client tags. A client never sends these.
                         .Ack, .TaskComplete, .LabelData, .TitleObserved, .SendAck => {},
@@ -629,6 +693,16 @@ pub const Client = struct {
     /// Prompt-editor capability bits this client advertised on .Init.
     /// See `prompt_editor_capability_monaco` / `_code_server`.
     prompt_editor_capabilities: u8 = 0,
+    /// CDXC:ZmxGridVisibility 2026-09-03: the last grid this client reported
+    /// (Init, Resize, or Visibility payload). `electLeader` applies it without
+    /// a `.Resize` round trip.
+    last_size: ?ipc.Resize = null,
+    /// True once the client said nobody is looking at its terminal
+    /// (`ZMX_HIDDEN`). Cleared by `ZMX_VISIBLE`, by user input, and on Init.
+    is_hidden: bool = false,
+    /// Copy of `Daemon.activity_clock` taken the last time this client
+    /// attached, typed, or claimed visibility. Higher = more recent.
+    activity: u64 = 0,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
 
@@ -681,7 +755,13 @@ pub const Daemon = struct {
     task_id: [4]u8 = undefined,
     task_exit_code: ?u8 = null, // null = running or n/a, set when task completes
     task_ended_at: ?u64 = null, // timestamp when task exited
-    pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
+    pty_fd: i32 = -1, // set by daemonLoop
+    /// The daemon's own terminal, set by daemonLoop. Needed by grid changes
+    /// that start from places without a `term` parameter (`closeClient`).
+    term: ?*ghostty_vt.Terminal = null,
+    /// CDXC:ZmxGridVisibility 2026-09-03: monotonic counter behind
+    /// `Client.activity`; bumped on attach, user input, and visible claims.
+    activity_clock: u64 = 0,
     shell: []const u8 = "/bin/sh",
     title_coalescer: title_events.Coalescer = .{},
     /// Set by `run()` when this process actually created the session. Lets a
@@ -730,8 +810,8 @@ pub const Daemon = struct {
 
     pub fn closeClient(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
-        // leader is disconnected, remove ref and let another client claim leader on input
-        if (self.leader_client_fd == client.socket_fd) {
+        const was_leader = self.leader_client_fd == client.socket_fd;
+        if (was_leader) {
             std.log.info(
                 "unsetting leader session=<redacted> fd={d}",
                 .{client.socket_fd},
@@ -745,6 +825,14 @@ pub const Daemon = struct {
         if (shutdown_on_last and self.clients.items.len == 0) {
             self.shutdown(gpa);
             return true;
+        }
+        // The leader left: hand the grid to whoever is still looking, or
+        // let it rest wide. Must run after the removal so the departed
+        // client is not a candidate.
+        if (was_leader) {
+            self.electLeader(gpa) catch |err| {
+                std.log.warn("leader election failed err={s}", .{@errorName(err)});
+            };
         }
         return false;
     }
@@ -943,9 +1031,183 @@ pub const Daemon = struct {
     fn setLeader(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         std.log.info("setting new leader client_fd={d}", .{client.socket_fd});
         self.leader_client_fd = client.socket_fd;
+        if (client.last_size) |resize| {
+            // The client already told us its grid: apply it directly.
+            _ = try self.applyGridIfChanged(gpa, resize);
+            return;
+        }
         // Send a resize message to the client so it can send us back their window size
         // so we can resize the pty and ghostty state.
         try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
+        client.has_pending_output = true;
+    }
+
+    // ==================================================================
+    // CDXC:ZmxGridVisibility 2026-09-03: who may size the pty
+    //
+    // Ghostex keeps agent CLIs inside zmx sessions and feeds its chat view
+    // from the daemon's own screen (`.History`), so the daemon's grid decides
+    // where the CLI wraps and truncates lines. The policy is: only a terminal
+    // somebody is looking at may size the pty; when nobody is looking, the
+    // grid rests wide (`ipc.RESTING_GRID_COLS`).
+    //
+    //   - A client that just attached (`.Init`) is displaying, so it always
+    //     becomes leader and its size is applied at once.
+    //   - Ghostex tells the attach client whether its terminal is on screen
+    //     through the in-band `ZMX_VISIBLE=<rows>,<cols>` / `ZMX_HIDDEN=...`
+    //     OSCs, which the client turns into `.Visibility`. A visible claim
+    //     takes leadership and applies the size; a hidden claim marks the
+    //     client hidden and, if it was the leader, re-elects.
+    //   - When the leader detaches or hides, `electLeader` picks the most
+    //     recently active displayed terminal client (attach, typing, or
+    //     visible claim bump `activity`). If only hidden clients remain the
+    //     grid rests at RESTING_GRID_COLS x (the freshest hidden client's
+    //     rows) with no leader; with no terminal clients at all it rests at
+    //     RESTING_GRID_COLS x current rows.
+    //   - Typing from a hidden client clears its hidden flag (a keystroke
+    //     proves someone is at that terminal) and, as before, takes leadership
+    //     from a non-leader.
+    //   - `zmx send` / `.RefreshIfStale` stay leadership-neutral.
+    //   - Headless `zmx run` (no tty on stdout) sends no `.Resize`, so a
+    //     freshly spawned daemon starts at the resting grid, which is also the
+    //     `getTerminalSize` no-tty fallback.
+    // ==================================================================
+
+    fn touchActivity(self: *Daemon, client: *Client) void {
+        self.activity_clock += 1;
+        client.activity = self.activity_clock;
+    }
+
+    fn currentGrid(term: *ghostty_vt.Terminal) ipc.Resize {
+        return .{
+            .rows = @intCast(term.screens.active.pages.rows),
+            .cols = @intCast(term.screens.active.pages.cols),
+        };
+    }
+
+    /// Resize the pty and the daemon terminal to `resize` unless that is
+    /// already the grid. Returns whether anything changed.
+    fn applyGridIfChanged(self: *Daemon, gpa: std.mem.Allocator, resize: ipc.Resize) !bool {
+        const term = self.term orelse return false;
+        const current = currentGrid(term);
+        if (current.rows == resize.rows and current.cols == resize.cols) return false;
+        try self.applyTerminalResize(gpa, self.pty_fd, term, resize);
+        return true;
+    }
+
+    /// Choose the pty size owner after the leader detached or hid. See the
+    /// CDXC:ZmxGridVisibility block above for the rules.
+    fn electLeader(self: *Daemon, gpa: std.mem.Allocator) !void {
+        const term = self.term orelse return;
+        var visible: ?*Client = null;
+        var hidden: ?*Client = null;
+        for (self.clients.items) |client| {
+            if (!client.is_terminal) continue;
+            if (client.is_hidden) {
+                if (hidden == null or client.activity > hidden.?.activity) hidden = client;
+            } else {
+                if (visible == null or client.activity > visible.?.activity) visible = client;
+            }
+        }
+
+        var changed = false;
+        if (visible) |client| {
+            std.log.info("elected leader client_fd={d}", .{client.socket_fd});
+            self.leader_client_fd = client.socket_fd;
+            if (client.last_size) |resize| {
+                changed = try self.applyGridIfChanged(gpa, resize);
+            } else {
+                try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
+                client.has_pending_output = true;
+            }
+        } else {
+            self.leader_client_fd = null;
+            const rows: u16 = blk: {
+                if (hidden) |client| {
+                    if (client.last_size) |resize| break :blk resize.rows;
+                }
+                break :blk currentGrid(term).rows;
+            };
+            std.log.info(
+                "no displayed client, resting grid rows={d} cols={d} hidden_clients={}",
+                .{ rows, ipc.RESTING_GRID_COLS, hidden != null },
+            );
+            changed = try self.applyGridIfChanged(gpa, .{ .rows = rows, .cols = ipc.RESTING_GRID_COLS });
+        }
+
+        if (changed) {
+            for (self.clients.items) |client| {
+                if (!client.is_terminal) continue;
+                self.appendVisibleRefresh(gpa, client, term);
+            }
+        }
+    }
+
+    /// `.Visibility`: the attach client relayed a `ZMX_VISIBLE` / `ZMX_HIDDEN`
+    /// OSC. Only terminal clients (those that sent `.Init`) may claim.
+    pub fn handleVisibility(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        const visibility = ipc.Visibility.decode(payload) orelse return;
+        if (!client.is_terminal) return;
+        client.last_size = visibility.resize;
+        if (!visibility.hidden) {
+            client.is_hidden = false;
+            self.touchActivity(client);
+            std.log.info(
+                "client visible, taking leadership client_fd={d} rows={d} cols={d}",
+                .{ client.socket_fd, visibility.resize.rows, visibility.resize.cols },
+            );
+            self.leader_client_fd = client.socket_fd;
+            // A claim that changes the grid (a parked client always rests at
+            // the wide grid, so surfacing always does) repaints every client
+            // from the daemon's screen, exactly like `refresh-if-stale` when
+            // stale: the client's own reflow of the resting-width content and
+            // the daemon's reflow diverge otherwise, and a shell prompt never
+            // repaints on SIGWINCH by itself.
+            if (try self.applyGridIfChanged(gpa, visibility.resize)) {
+                const term = self.term orelse return;
+                for (self.clients.items) |existing| {
+                    if (!existing.is_terminal) continue;
+                    self.appendVisibleRefresh(gpa, existing, term);
+                }
+            }
+            return;
+        }
+        client.is_hidden = true;
+        std.log.info("client hidden client_fd={d}", .{client.socket_fd});
+        if (self.leader_client_fd == client.socket_fd) {
+            try self.electLeader(gpa);
+        }
+    }
+
+    /// `.GridInfo`: answer with one JSON object describing the grid, the
+    /// leader, and every terminal client. Diagnostics for `zmx grid`.
+    pub fn handleGridInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
+        var builder: std.Io.Writer.Allocating = .init(gpa);
+        defer builder.deinit();
+        const w = &builder.writer;
+        const grid = currentGrid(term);
+        try w.print(
+            "{{\"rows\":{d},\"cols\":{d},\"leader_fd\":{d},\"resting_rows\":{d},\"resting_cols\":{d},\"clients\":[",
+            .{ grid.rows, grid.cols, self.leader_client_fd orelse -1, ipc.RESTING_GRID_ROWS, ipc.RESTING_GRID_COLS },
+        );
+        var first = true;
+        for (self.clients.items) |existing| {
+            if (!existing.is_terminal) continue;
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print(
+                "{{\"fd\":{d},\"hidden\":{},\"activity\":{d},\"last_size\":",
+                .{ existing.socket_fd, existing.is_hidden, existing.activity },
+            );
+            if (existing.last_size) |resize| {
+                try w.print("{{\"rows\":{d},\"cols\":{d}}}", .{ resize.rows, resize.cols });
+            } else {
+                try w.writeAll("null");
+            }
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+        try ipc.appendMessage(gpa, &client.write_buf, .GridInfo, builder.written());
         client.has_pending_output = true;
     }
 
@@ -993,6 +1255,13 @@ pub const Daemon = struct {
         // NOTE: for local dev only
         // std.log.debug("buffering pty input data={x}", .{payload});
 
+        const is_user_input = util.isUserInput(payload);
+        if (is_user_input) {
+            // A keystroke proves someone is at this terminal.
+            client.is_hidden = false;
+            self.touchActivity(client);
+        }
+
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
             self.queuePtyInput(gpa, payload);
@@ -1000,7 +1269,7 @@ pub const Daemon = struct {
         }
 
         // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
+        if (is_user_input) {
             try self.setLeader(gpa, client);
             self.queuePtyInput(gpa, payload);
         }
@@ -1147,22 +1416,21 @@ pub const Daemon = struct {
             }
         }
 
-        // no leader is set so set one
-        if (self.leader_client_fd == null) {
-            try self.setLeader(gpa, client);
-        }
+        // A client that just attached is being looked at, so it always takes
+        // leadership and its grid is applied at once (CDXC:ZmxGridVisibility).
+        const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+        client.is_hidden = false;
+        client.last_size = resize;
+        self.touchActivity(client);
+        std.log.info("init: new leader client_fd={d}", .{client.socket_fd});
+        self.leader_client_fd = client.socket_fd;
+        try self.applyTerminalResize(gpa, pty_fd, term, resize);
 
-        // only resize if leader
-        if (self.leader_client_fd == client.socket_fd) {
-            const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
-            try self.applyTerminalResize(gpa, pty_fd, term, resize);
+        // Mark that we've had a client init, so subsequent clients get terminal state
+        self.has_had_client = true;
+        self.has_terminal_client = true;
 
-            // Mark that we've had a client init, so subsequent clients get terminal state
-            self.has_had_client = true;
-            self.has_terminal_client = true;
-
-            std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
-        }
+        std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
     pub fn handleResize(
@@ -1174,13 +1442,22 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
+        client.last_size = resize;
+        // A hidden client (SIGWINCH relayed after ZMX_HIDDEN) may only record
+        // its size: nobody is looking at it, so it never sizes the pty. With
+        // no leader, let the resting/visible rule decide from the fresh size.
+        if (client.is_hidden) {
+            if (self.leader_client_fd == null) try self.electLeader(gpa);
+            return;
+        }
         if (self.leader_client_fd == null) {
-            try self.setLeader(gpa, client);
+            std.log.info("resize with no leader: sender becomes leader client_fd={d}", .{client.socket_fd});
+            self.leader_client_fd = client.socket_fd;
         }
         // only leader can resize
         if (self.leader_client_fd != client.socket_fd) return;
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload);
         try self.applyTerminalResize(gpa, pty_fd, term, resize);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1349,6 +1626,11 @@ pub const Daemon = struct {
             gpa.destroy(client_to_close);
         }
         self.clients.clearRetainingCapacity();
+        // Nobody is looking any more: rest the grid wide.
+        self.leader_client_fd = null;
+        self.electLeader(gpa) catch |err| {
+            std.log.warn("leader election failed err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn handleKill(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {

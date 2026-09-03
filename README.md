@@ -456,6 +456,32 @@ The log directory is resolved in this order:
 1. `HOME/.local/state/zmx/logs`
 1. `TMPDIR/zmx-$UID` (or `/tmp/zmx-$UID`) as a last resort
 
+## Ghostex private OSC sequences and `zmx grid`
+
+This fork carries Ghostex-only behavior layered on the attach protocol. An
+attach client consumes these in-band sequences from its stdin (they are never
+forwarded to the pty) and turns them into IPC messages; the canonical parser is
+`appendClientInputMessages` in `src/loop.zig`.
+
+- `ESC ] 1337 ; ZMX_REFRESH BEL` — ask the daemon to repaint this client from
+  its own screen state (`RefreshIfStale`); leadership-neutral.
+- `ESC ] 1337 ; ZMX_VISIBLE=<rows>,<cols> BEL` — this client's terminal is on
+  screen at that size (IPC tag `Visibility=26`).
+- `ESC ] 1337 ; ZMX_HIDDEN=<rows>,<cols> BEL` — this client's terminal is not
+  being displayed.
+
+Grid policy: only a terminal somebody is looking at may size the pty. A fresh
+attach is displaying and becomes leader at once; a visible claim takes
+leadership and applies its size; a hidden claim drops the client out of
+leadership and re-elects the most recently active displayed client. When only
+hidden clients (or none) remain, the grid rests at `RESTING_GRID_COLS` (200
+columns, `src/ipc.zig`) by the freshest known rows (50 at headless spawn).
+Typing from a hidden client clears its hidden flag; `zmx send` never changes
+leadership.
+
+`zmx grid <name>` (IPC tag `GridInfo=27`) prints the daemon's current grid,
+leader, resting size, and attached clients as JSON for debugging.
+
 ## a smol contract
 
 - Write programs that solve a well defined problem.

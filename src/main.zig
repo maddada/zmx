@@ -207,6 +207,19 @@ pub fn main(init: std.process.Init) !void {
         };
         defer gpa.free(socket_path);
         return refreshIfStale(gpa, io, &cfg, sesh, socket_path, .{ .rows = rows, .cols = cols });
+    } else if (std.mem.eql(u8, cmd, "grid")) {
+        const session_name = args.next() orelse "";
+        if (detectHelp(session_name)) return help(io);
+        if (session_name.len == 0) return error.SessionNameRequired;
+
+        const sesh = try socket.getSeshName(gpa, session_name);
+        defer gpa.free(sesh);
+        const socket_path = socket.getSocketPath(gpa, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(io, sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        defer gpa.free(socket_path);
+        return printGridInfo(gpa, io, socket_path);
     } else if (std.mem.eql(u8, cmd, "watch-title")) {
         const session_name = args.next() orelse "";
         if (detectHelp(session_name)) return help(io);
@@ -501,6 +514,7 @@ fn help(io: std.Io) !void {
         \\  [s]end <name> <text...>                  Send raw input to session PTY
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  refresh-if-stale <name> <rows> <cols>    Repaint clients only when daemon grid differs
+        \\  grid <name>                              Print the daemon grid and client leadership as JSON
         \\  watch-title <name>                       Stream coalesced title observations as JSON lines
         \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
@@ -611,8 +625,21 @@ fn help(io: std.Io) !void {
         \\  OSC 1337;ZMX_REFRESH to its own PTY; zmx consumes that sequence
         \\  locally and never forwards it to the shell.
         \\
+        \\  Two sibling in-band sequences report whether a client's terminal is
+        \\  being looked at, with its grid as decimal rows,cols:
+        \\    ESC ] 1337 ; ZMX_VISIBLE=<rows>,<cols> BEL
+        \\    ESC ] 1337 ; ZMX_HIDDEN=<rows>,<cols> BEL
+        \\  Only a displayed terminal may size the pty: a client that attaches
+        \\  or reports VISIBLE becomes the leader and its grid is applied. When
+        \\  the leader detaches or reports HIDDEN, the most recently active
+        \\  displayed client takes over; with no displayed client the grid
+        \\  rests at 200 columns (rows from the freshest hidden client). A
+        \\  headless `zmx run` (no tty) starts the session at 50x200.
+        \\  `grid` prints the current grid, leader fd, and per-client state.
+        \\
         \\  Examples:
         \\    zmx refresh-if-stale dev 40 120
+        \\    zmx grid dev
         \\
         \\Watch title:
         \\  Streams coalesced terminal-title observations as JSON lines. Spinner
@@ -678,9 +705,11 @@ fn help(io: std.Io) !void {
 fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
+    // `wire_generation` is read by gxserver (CDXC:ZmxWireGeneration); keep the
+    // `<key>\t<value>` line shape.
     try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
-        .{ version, ghostty_version, cfg.socket_dir, cfg.log_dir },
+        "zmx\t\t{s}\nghostty_vt\t{s}\nwire_generation\t{d}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
+        .{ version, ghostty_version, ipc.WIRE_GENERATION, cfg.socket_dir, cfg.log_dir },
     );
     try w.interface.flush();
 }
@@ -1942,6 +1971,25 @@ fn printPromptEditorCapability(gpa: std.mem.Allocator, io: std.Io, socket_path: 
 ///
 /// Subscribes to the daemon's coalesced terminal-title observations and streams
 /// them as JSON lines ({"title":"..."}) until the session ends.
+/// `zmx grid <name>`
+///
+/// Prints the daemon's grid, leader fd (-1 when the grid is resting), and
+/// every terminal client's visibility, last reported size, and activity as
+/// one JSON line. Diagnostics for CDXC:ZmxGridVisibility.
+fn printGridInfo(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
+    const reply = ipc.roundTripForTag(gpa, socket_path, .GridInfo, "", .GridInfo) catch |err| {
+        std.log.err("grid info failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer gpa.free(reply);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(reply);
+    try w.interface.writeByte('\n');
+    try w.interface.flush();
+}
+
 fn watchTitle(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
     const client_sock = try socket.sessionConnect(socket_path);
     defer lib_posix.close(client_sock);
@@ -2068,8 +2116,14 @@ fn run(
     };
     defer lib_posix.close(client_sock);
 
-    const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-    ipc.send(client_sock, .Resize, std.mem.asBytes(&term_size)) catch {};
+    // CDXC:ZmxGridVisibility 2026-09-03: a headless spawn (gxserver running
+    // `zmx run` with no tty) has no terminal anyone is looking at, so it must
+    // not size the pty. Skipping the `.Resize` leaves a fresh daemon at the
+    // resting grid from `getTerminalSize`'s no-tty fallback.
+    if (cross.c.isatty(lib_posix.STDOUT_FILENO) == 1) {
+        const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+        ipc.send(client_sock, .Resize, std.mem.asBytes(&term_size)) catch {};
+    }
 
     var fds = try std.ArrayList(i32).initCapacity(gpa, 1);
     defer fds.deinit(gpa);

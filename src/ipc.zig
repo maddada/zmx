@@ -3,6 +3,34 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
 
+/// CDXC:ZmxWireGeneration 2026-09-03: the generation of the client<->daemon
+/// wire contract this binary speaks, printed by `zmx version` as
+/// `wire_generation\t<n>`. A daemon keeps running the code of the binary that
+/// spawned it, so gxserver records this number per session and cycles (kills
+/// and later restores) only the daemons whose recorded generation differs
+/// from the bundled binary's. Cycling kills whatever agent is running inside
+/// the session, so this number must change exactly when an OLD daemon can no
+/// longer serve a NEW client:
+///
+/// BUMP when
+///   - a `Tag` value is renumbered or removed,
+///   - the payload layout of an existing tag changes (`Resize`, `Visibility`,
+///     the `Init` header, a JSON reply schema a client parses strictly, ...),
+///   - an existing tag changes meaning, or
+///   - a client starts to REQUIRE a reply to a new tag without a compatibility
+///     probe (the `SendAcked` ping in `sendToSessionPty` is the model for
+///     avoiding that).
+/// DO NOT bump when
+///   - a new tag is added that old daemons drop through their `_` arm and
+///     clients tolerate the silence (`Visibility`, `GridInfo`),
+///   - a daemon-side bug fix, log line, or performance change lands, or
+///   - upstream code unrelated to the IPC framing is merged.
+///
+/// Generation 1 is the contract of tags 0-27 as of 2026-09-03 and every
+/// binary since the 2026-08-23 tag renumbering, which is why gxserver treats
+/// its older binary-identity stamps as generation 1.
+pub const WIRE_GENERATION: u32 = 1;
+
 pub const Tag = enum(u8) {
     Input = 0,
     Output = 1,
@@ -47,6 +75,15 @@ pub const Tag = enum(u8) {
     /// Daemon -> client receipt for `SendAcked`. Payload is one byte holding
     /// a `SendAckStatus`.
     SendAck = 25,
+    /// Client -> daemon: "my terminal is (not) being looked at, and this is
+    /// its size". Payload is `@sizeOf(Visibility)` bytes (see `Visibility`).
+    /// Added 2026-09-03 (CDXC:ZmxGridVisibility) so only a terminal someone is
+    /// looking at may size the pty; old daemons drop it via the `_` arm.
+    Visibility = 26,
+    /// Client -> daemon request with an empty payload; daemon -> client reply
+    /// whose payload is one JSON object (no trailing newline) describing the
+    /// grid and leadership state. See `Daemon.handleGridInfo`.
+    GridInfo = 27,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -71,6 +108,42 @@ pub const Resize = packed struct {
     ypixel: u16 = 0,
 };
 
+/// CDXC:ZmxGridVisibility 2026-09-03: grid the daemon rests at when no
+/// displayed terminal client owns the pty size. Wide enough that agent CLIs
+/// (Claude Code, Codex, ...) stop truncating lines for the chat view that
+/// reads the daemon's screen; also the no-tty fallback for `getTerminalSize`,
+/// so headless `zmx run` spawns start here instead of at 24x120.
+pub const RESTING_GRID_COLS: u16 = 200;
+pub const RESTING_GRID_ROWS: u16 = 50;
+
+/// Payload of `Tag.Visibility`. Fixed 9-byte wire layout (`VISIBILITY_WIRE_LEN`),
+/// encoded by hand so no struct padding ever travels:
+///   [0]    hidden: 0 = the terminal is displayed, 1 = hidden
+///   [1..9] resize: the 8 `Resize` bytes exactly as `.Resize` ships them
+///          (rows u16, cols u16, xpixel u16, ypixel u16, host byte order)
+pub const Visibility = struct {
+    hidden: bool,
+    resize: Resize,
+
+    pub fn encode(self: Visibility) [VISIBILITY_WIRE_LEN]u8 {
+        var out: [VISIBILITY_WIRE_LEN]u8 = undefined;
+        out[0] = @intFromBool(self.hidden);
+        @memcpy(out[1..], std.mem.asBytes(&self.resize));
+        return out;
+    }
+
+    /// Returns null for a payload of the wrong length.
+    pub fn decode(payload: []const u8) ?Visibility {
+        if (payload.len != VISIBILITY_WIRE_LEN) return null;
+        return .{
+            .hidden = payload[0] != 0,
+            .resize = std.mem.bytesToValue(Resize, payload[1..][0..@sizeOf(Resize)]),
+        };
+    }
+};
+
+pub const VISIBILITY_WIRE_LEN = 1 + @sizeOf(Resize);
+
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
@@ -89,7 +162,7 @@ pub fn getTerminalSize(fd: i32) Resize {
             return .{ .rows = ws.ws_row, .cols = ws.ws_col, .xpixel = ws.ws_xpixel, .ypixel = ws.ws_ypixel };
         }
     } else |_| {}
-    return .{ .rows = 24, .cols = 120 };
+    return .{ .rows = RESTING_GRID_ROWS, .cols = RESTING_GRID_COLS };
 }
 
 pub const MAX_CMD_LEN = 256;
@@ -472,11 +545,25 @@ test "Tag wire values are frozen" {
 
 test "Ghostex fork Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Refresh, 19 },        .{ Tag.TitleSubscribe, 20 },
-        .{ Tag.TitleObserved, 21 },  .{ Tag.RefreshIfStale, 22 },
-        .{ Tag.PromptEditorCapability, 23 },
-        .{ Tag.SendAcked, 24 },      .{ Tag.SendAck, 25 },
+        .{ Tag.Refresh, 19 },                .{ Tag.TitleSubscribe, 20 },
+        .{ Tag.TitleObserved, 21 },          .{ Tag.RefreshIfStale, 22 },
+        .{ Tag.PromptEditorCapability, 23 }, .{ Tag.SendAcked, 24 },
+        .{ Tag.SendAck, 25 },                .{ Tag.Visibility, 26 },
+        .{ Tag.GridInfo, 27 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "Visibility wire layout is frozen" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(Resize));
+    try std.testing.expectEqual(@as(usize, 9), VISIBILITY_WIRE_LEN);
+    const v = Visibility{ .hidden = true, .resize = .{ .rows = 40, .cols = 150 } };
+    const bytes = v.encode();
+    try std.testing.expectEqual(@as(u8, 1), bytes[0]);
+    const back = Visibility.decode(&bytes) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(back.hidden);
+    try std.testing.expectEqual(@as(u16, 40), back.resize.rows);
+    try std.testing.expectEqual(@as(u16, 150), back.resize.cols);
+    try std.testing.expect(Visibility.decode(bytes[0..8]) == null);
 }
 
 pub fn roundTripForTag(
