@@ -1,4 +1,4 @@
-# CDXC:Toolchain 2026-08-23-00:00:
+# CDXC:Build 2026-08-23-00:00:
 # zmx and its ghostty package dependency require Zig 0.16 (build.zig.zon pins
 # minimum_zig_version = "0.16.0"). Keep this project-local mise pin so zmx
 # builds do not accidentally use a different Zig required by sibling projects.

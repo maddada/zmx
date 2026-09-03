@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         // Freed here (client process only): Daemon.deinit deliberately does
         // not free socket_path, and the daemon process exits inside run()
         // without ever unwinding back to this defer. See
-        // CDXC:ZmxForkChildMallocExit in loop.zig.
+        // CDXC:Zmx in loop.zig.
         defer gpa.free(socket_path);
         var daemon = Daemon.init(io, &cfg, sesh, socket_path);
         daemon.command = command;
@@ -247,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.startsWith(u8, arg, "-d")) {
                 detached = true;
             } else if (std.mem.eql(u8, arg, "--initial-command")) {
-                // CDXC:ZmxProviderStartup 2026-06-08-21:18:
+                // CDXC:Zmx 2026-06-08-21:18:
                 // Ghostex restore must create missing zmx providers with an
                 // initial argv instead of sending large restore scripts through
                 // shell input. The flag is intentionally a no-op for existing
@@ -1469,7 +1469,7 @@ const AttachArgs = struct {
     missing_labels_value: bool = false,
     /// `--require-existing`: attach must not create the session.
     ///
-    /// CDXC:GhostexZmxProviderOwnership 2026-07-15:
+    /// CDXC:Zmx 2026-07-15:
     /// Ghostex-owned attach commands use --require-existing so an attach can
     /// never win a missing-provider race and create a plain shell without the
     /// gxserver initialization command. Normal zmx attach keeps its historical
@@ -1545,7 +1545,7 @@ fn attach(
         return switchSesh(gpa, io, daemon, sesh);
     }
 
-    // CDXC:GhostexZmxProviderOwnership 2026-07-15: --require-existing skips
+    // CDXC:Zmx 2026-07-15: --require-existing skips
     // session creation entirely, so a racing attach can never replace a
     // gxserver-owned provider with a plain shell.
     if (!require_existing) {
@@ -1975,7 +1975,7 @@ fn printPromptEditorCapability(gpa: std.mem.Allocator, io: std.Io, socket_path: 
 ///
 /// Prints the daemon's grid, leader fd (-1 when the grid is resting), and
 /// every terminal client's visibility, last reported size, and activity as
-/// one JSON line. Diagnostics for CDXC:ZmxGridVisibility.
+/// one JSON line. Diagnostics for CDXC:Zmx.
 fn printGridInfo(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void {
     const reply = ipc.roundTripForTag(gpa, socket_path, .GridInfo, "", .GridInfo) catch |err| {
         std.log.err("grid info failed: {s}", .{@errorName(err)});
@@ -2116,7 +2116,7 @@ fn run(
     };
     defer lib_posix.close(client_sock);
 
-    // CDXC:ZmxGridVisibility 2026-09-03: a headless spawn (gxserver running
+    // CDXC:Zmx 2026-09-03: a headless spawn (gxserver running
     // `zmx run` with no tty) has no terminal anyone is looking at, so it must
     // not size the pty. Skipping the `.Resize` leaves a fresh daemon at the
     // resting grid from `getTerminalSize`'s no-tty fallback.

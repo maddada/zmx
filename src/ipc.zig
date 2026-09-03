@@ -77,7 +77,7 @@ pub const Tag = enum(u8) {
     SendAck = 25,
     /// Client -> daemon: "my terminal is (not) being looked at, and this is
     /// its size". Payload is `@sizeOf(Visibility)` bytes (see `Visibility`).
-    /// Added 2026-09-03 (CDXC:ZmxGridVisibility) so only a terminal someone is
+    /// Added 2026-09-03 (CDXC:Zmx) so only a terminal someone is
     /// looking at may size the pty; old daemons drop it via the `_` arm.
     Visibility = 26,
     /// Client -> daemon request with an empty payload; daemon -> client reply
@@ -108,7 +108,7 @@ pub const Resize = packed struct {
     ypixel: u16 = 0,
 };
 
-/// CDXC:ZmxGridVisibility 2026-09-03: grid the daemon rests at when no
+/// CDXC:Zmx 2026-09-03: grid the daemon rests at when no
 /// displayed terminal client owns the pty size. Wide enough that agent CLIs
 /// (Claude Code, Codex, ...) stop truncating lines for the chat view that
 /// reads the daemon's screen; also the no-tty fallback for `getTerminalSize`,

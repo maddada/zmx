@@ -79,7 +79,7 @@ pub fn sessionConnect(sesh: []const u8) !i32 {
 }
 
 pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8) void {
-    // CDXC:ZmxDiagnosticsPrivacy 2026-05-30-23:59:
+    // CDXC:Telemetry 2026-05-30-23:59:
     // zmx can be used outside Ghostex with user-chosen session names, so daemon
     // logs must not persist raw socket/session names. Log lifecycle phases and
     // errors only; Ghostex-owned correlation happens through gxserver

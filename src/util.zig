@@ -894,7 +894,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
 /// Serialize only the active viewport, as a clear-and-repaint snapshot.
 ///
-/// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex can ask an already attached
+/// CDXC:Zmx 2026-05-20-09:57: Ghostex can ask an already attached
 /// zmx client to repaint a stale visible pane. Refresh output must not include
 /// scrollback because the client already owns that history; emit only a
 /// clear-and-repaint snapshot of the active viewport so no bytes reach the PTY

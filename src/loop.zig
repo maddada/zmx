@@ -23,7 +23,7 @@ pub const prompt_editor_capability_code_server: u8 = 2;
 /// it into a Refresh IPC so the shell/PTY never receives the control bytes.
 pub const ghostex_refresh_sequence = "\x1b]1337;ZMX_REFRESH\x07";
 
-/// CDXC:ZmxGridVisibility 2026-09-03: every Ghostex private OSC shares this
+/// CDXC:Zmx 2026-09-03: every Ghostex private OSC shares this
 /// prefix. The body between the prefix and the BEL terminator selects the IPC:
 ///   REFRESH               -> `.Refresh`
 ///   VISIBLE=<rows>,<cols> -> `.Visibility{ hidden = 0, resize = rows x cols }`
@@ -78,7 +78,7 @@ fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
 /// Split raw client stdin into IPC messages, converting Ghostex's private
 /// OSCs (refresh, visible, hidden) into IPC instead of forwarding them to the PTY.
 ///
-/// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex sends a private OSC refresh
+/// CDXC:Zmx 2026-05-20-09:57: Ghostex sends a private OSC refresh
 /// request through the attached terminal because that path is already connected
 /// to the correct zmx client. zmx must consume that exact sequence locally and
 /// convert it to Refresh IPC so the shell/PTY never receives the control bytes.
@@ -547,7 +547,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         // `.SendAcked` payloads. Log it as an error with the
                         // byte count so the loss is attributable. Session
                         // names stay out of daemon logs on purpose
-                        // (CDXC:ZmxDiagnosticsPrivacy); the log file is named
+                        // (CDXC:Telemetry); the log file is named
                         // after this daemon's pid, which identifies it.
                         std.log.err(
                             "pty write failed: {s}; dropped {d} unflushed pty input bytes session=<redacted>",
@@ -693,7 +693,7 @@ pub const Client = struct {
     /// Prompt-editor capability bits this client advertised on .Init.
     /// See `prompt_editor_capability_monaco` / `_code_server`.
     prompt_editor_capabilities: u8 = 0,
-    /// CDXC:ZmxGridVisibility 2026-09-03: the last grid this client reported
+    /// CDXC:Zmx 2026-09-03: the last grid this client reported
     /// (Init, Resize, or Visibility payload). `electLeader` applies it without
     /// a `.Resize` round trip.
     last_size: ?ipc.Resize = null,
@@ -759,7 +759,7 @@ pub const Daemon = struct {
     /// The daemon's own terminal, set by daemonLoop. Needed by grid changes
     /// that start from places without a `term` parameter (`closeClient`).
     term: ?*ghostty_vt.Terminal = null,
-    /// CDXC:ZmxGridVisibility 2026-09-03: monotonic counter behind
+    /// CDXC:Zmx 2026-09-03: monotonic counter behind
     /// `Client.activity`; bumped on attach, user input, and visible claims.
     activity_clock: u64 = 0,
     shell: []const u8 = "/bin/sh",
@@ -793,7 +793,7 @@ pub const Daemon = struct {
         // socket_path is NOT freed here: init()'s contract says the caller
         // owns everything passed into it, and in the daemon process it is a
         // PRE-fork allocation that must never be freed post-fork (see the
-        // CDXC:ZmxForkChildMallocExit comment in run()). The client process
+        // CDXC:Zmx comment in run()). The client process
         // frees it via its own defer at the attach call site in main.zig.
     }
 
@@ -954,7 +954,7 @@ pub const Daemon = struct {
         const new_io = threaded.io();
 
         { // re-initialize logs under a name that does not leak the session
-            // CDXC:ZmxDiagnosticsPrivacy 2026-05-31-00:18:
+            // CDXC:Telemetry 2026-05-31-00:18:
             // Users must be able to zip and send zmx log directories without
             // exposing session names. Use the daemon process id in the
             // per-session log filename so support can still correlate
@@ -1008,7 +1008,7 @@ pub const Daemon = struct {
         lib_posix.close(pty_info.master_fd);
         _ = lib_posix.waitpid(self.pid, 0);
 
-        // CDXC:ZmxForkChildMallocExit 2026-08-30:
+        // CDXC:Zmx 2026-08-30:
         // The daemon process is the child of daemonize()'s fork and never
         // execs. Zig 0.16's std.process.Init starts a std.Io.Threaded pool
         // before main(), so the client is multi-threaded when it forks, and on
@@ -1043,7 +1043,7 @@ pub const Daemon = struct {
     }
 
     // ==================================================================
-    // CDXC:ZmxGridVisibility 2026-09-03: who may size the pty
+    // CDXC:Zmx 2026-09-03: who may size the pty
     //
     // Ghostex keeps agent CLIs inside zmx sessions and feeds its chat view
     // from the daemon's own screen (`.History`), so the daemon's grid decides
@@ -1096,7 +1096,7 @@ pub const Daemon = struct {
     }
 
     /// Choose the pty size owner after the leader detached or hid. See the
-    /// CDXC:ZmxGridVisibility block above for the rules.
+    /// CDXC:Zmx block above for the rules.
     fn electLeader(self: *Daemon, gpa: std.mem.Allocator) !void {
         const term = self.term orelse return;
         var visible: ?*Client = null;
@@ -1417,7 +1417,7 @@ pub const Daemon = struct {
         }
 
         // A client that just attached is being looked at, so it always takes
-        // leadership and its grid is applied at once (CDXC:ZmxGridVisibility).
+        // leadership and its grid is applied at once (CDXC:Zmx).
         const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
         client.is_hidden = false;
         client.last_size = resize;
@@ -1484,7 +1484,7 @@ pub const Daemon = struct {
         }
     }
 
-    /// CDXC:ZmxPersistence 2026-05-20-09:57: Ghostex refreshes stale zmx-backed
+    /// CDXC:Zmx 2026-05-20-09:57: Ghostex refreshes stale zmx-backed
     /// panes by asking the zmx daemon to repaint attached terminal clients from
     /// tracked VT state. This is intentionally an IPC/display operation, never
     /// PTY input, so refresh cannot type escape bytes into the user's shell.
@@ -1502,7 +1502,7 @@ pub const Daemon = struct {
         requesting_client.has_pending_output = true;
     }
 
-    /// CDXC:ZmxPersistence 2026-06-05-21:27: Mac pane clicks should repair
+    /// CDXC:Zmx 2026-06-05-21:27: Mac pane clicks should repair
     /// sessions resized by another client, such as an iPhone attach, without
     /// repainting on every normal terminal click. Compare the caller's current
     /// grid to the daemon VT grid; ACK without Output when they already match
@@ -1542,7 +1542,7 @@ pub const Daemon = struct {
     /// created. Only a leader client that explicitly advertised support may open
     /// a host editor; every missing or non-advertised client returns "editor" so
     /// TUI, mobile, and plain SSH attaches stay on the machine editor.
-    /// CDXC:PromptEditorBackend 2026-06-30-03:11: Non-Monaco zmx clients
+    /// CDXC:PromptEditor 2026-06-30-03:11: Non-Monaco zmx clients
     /// advertise "editor" instead of the old gte sentinel because Ctrl+G
     /// fallback now runs the machine's EDITOR/VISUAL command.
     pub fn handlePromptEditorCapability(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1563,7 +1563,7 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 
-    /// CDXC:ZmxTitleObservations 2026-06-01-10:17:
+    /// CDXC:SessionStatus 2026-06-01-10:17:
     /// Title watchers should not receive the raw title captured at subscription
     /// time unless zmx has already emitted it as stable. New or restored
     /// surfaces can briefly expose shell/bootstrap titles before the agent
@@ -1656,7 +1656,7 @@ pub const Daemon = struct {
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
-        // CDXC:ZmxTitleObservations 2026-06-01-10:17:
+        // CDXC:SessionStatus 2026-06-01-10:17:
         // gxserver keeps a long-lived title watcher attached to each observed
         // zmx session. That watcher is process plumbing, not a user-visible
         // client, so `zmx list` client counts must ignore it while still
