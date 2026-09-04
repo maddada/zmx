@@ -26,6 +26,12 @@ const lib_posix = @import("posix.zig");
 ///   - a daemon-side bug fix, log line, or performance change lands, or
 ///   - upstream code unrelated to the IPC framing is merged.
 ///
+/// Generation 1 also covers the 2026-09-05 widening of the Visibility byte from
+/// `hidden: bool` to visible/chat/parked. Ghostex 8.8.0 already shipped tag 26
+/// with the boolean, so live daemons do read that byte, but the payload is still
+/// 9 bytes and an old daemon reads both chat and parked as `hidden = true` —
+/// the resting-grid behaviour 8.8.0 already had. It degrades, it does not break,
+/// so it is not worth cycling every live session and killing agents mid-task.
 /// Generation 1 is the contract of tags 0-27 as of 2026-09-03 and every
 /// binary since the 2026-08-23 tag renumbering, which is why gxserver treats
 /// its older binary-identity stamps as generation 1.
@@ -76,7 +82,7 @@ pub const Tag = enum(u8) {
     /// a `SendAckStatus`.
     SendAck = 25,
     /// Client -> daemon: "my terminal is (not) being looked at, and this is
-    /// its size". Payload is `@sizeOf(Visibility)` bytes (see `Visibility`).
+    /// its size". Payload is `VISIBILITY_WIRE_LEN` bytes (see `Visibility`).
     /// Added 2026-09-03 (CDXC:Zmx) so only a terminal someone is
     /// looking at may size the pty; old daemons drop it via the `_` arm.
     Visibility = 26,
@@ -118,25 +124,27 @@ pub const RESTING_GRID_ROWS: u16 = 50;
 
 /// Payload of `Tag.Visibility`. Fixed 9-byte wire layout (`VISIBILITY_WIRE_LEN`),
 /// encoded by hand so no struct padding ever travels:
-///   [0]    hidden: 0 = the terminal is displayed, 1 = hidden
+///   [0]    state: 0 = visible, 1 = chat, 2 = parked
 ///   [1..9] resize: the 8 `Resize` bytes exactly as `.Resize` ships them
 ///          (rows u16, cols u16, xpixel u16, ypixel u16, host byte order)
+pub const VisibilityState = enum(u8) { visible = 0, chat = 1, parked = 2 };
+
 pub const Visibility = struct {
-    hidden: bool,
+    state: VisibilityState,
     resize: Resize,
 
     pub fn encode(self: Visibility) [VISIBILITY_WIRE_LEN]u8 {
         var out: [VISIBILITY_WIRE_LEN]u8 = undefined;
-        out[0] = @intFromBool(self.hidden);
+        out[0] = @intFromEnum(self.state);
         @memcpy(out[1..], std.mem.asBytes(&self.resize));
         return out;
     }
 
-    /// Returns null for a payload of the wrong length.
+    /// Returns null for a payload of the wrong length or an unknown state.
     pub fn decode(payload: []const u8) ?Visibility {
         if (payload.len != VISIBILITY_WIRE_LEN) return null;
         return .{
-            .hidden = payload[0] != 0,
+            .state = std.enums.fromInt(VisibilityState, payload[0]) orelse return null,
             .resize = std.mem.bytesToValue(Resize, payload[1..][0..@sizeOf(Resize)]),
         };
     }
@@ -556,11 +564,11 @@ test "Ghostex fork Tag wire values are frozen" {
 test "Visibility wire layout is frozen" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Resize));
     try std.testing.expectEqual(@as(usize, 9), VISIBILITY_WIRE_LEN);
-    const v = Visibility{ .hidden = true, .resize = .{ .rows = 40, .cols = 150 } };
+    const v = Visibility{ .state = .chat, .resize = .{ .rows = 40, .cols = 150 } };
     const bytes = v.encode();
     try std.testing.expectEqual(@as(u8, 1), bytes[0]);
     const back = Visibility.decode(&bytes) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(back.hidden);
+    try std.testing.expectEqual(VisibilityState.chat, back.state);
     try std.testing.expectEqual(@as(u16, 40), back.resize.rows);
     try std.testing.expectEqual(@as(u16, 150), back.resize.cols);
     try std.testing.expect(Visibility.decode(bytes[0..8]) == null);

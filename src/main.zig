@@ -625,16 +625,20 @@ fn help(io: std.Io) !void {
         \\  OSC 1337;ZMX_REFRESH to its own PTY; zmx consumes that sequence
         \\  locally and never forwards it to the shell.
         \\
-        \\  Two sibling in-band sequences report whether a client's terminal is
+        \\  Three sibling in-band sequences report whether a client's terminal is
         \\  being looked at, with its grid as decimal rows,cols:
         \\    ESC ] 1337 ; ZMX_VISIBLE=<rows>,<cols> BEL
+        \\    ESC ] 1337 ; ZMX_CHAT=<rows>,<cols> BEL
         \\    ESC ] 1337 ; ZMX_HIDDEN=<rows>,<cols> BEL
         \\  Only a displayed terminal may size the pty: a client that attaches
         \\  or reports VISIBLE becomes the leader and its grid is applied. When
         \\  the leader detaches or reports HIDDEN, the most recently active
         \\  displayed client takes over; with no displayed client the grid
-        \\  rests at 200 columns (rows from the freshest hidden client). A
+        \\  widens to 200 columns only with a CHAT claim (freshest parked rows).
+        \\  HIDDEN means parked without a chat claim; otherwise keep the grid. A
         \\  headless `zmx run` (no tty) starts the session at 50x200.
+        \\  After the first visibility claim, report every size change by OSC;
+        \\  bare SIGWINCH sizes no longer size the shared pty for that client.
         \\  `grid` prints the current grid, leader fd, and per-client state.
         \\
         \\  Examples:

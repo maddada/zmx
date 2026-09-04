@@ -463,24 +463,25 @@ attach client consumes these in-band sequences from its stdin (they are never
 forwarded to the pty) and turns them into IPC messages; the canonical parser is
 `appendClientInputMessages` in `src/loop.zig`.
 
-- `ESC ] 1337 ; ZMX_REFRESH BEL` — ask the daemon to repaint this client from
-  its own screen state (`RefreshIfStale`); leadership-neutral.
-- `ESC ] 1337 ; ZMX_VISIBLE=<rows>,<cols> BEL` — this client's terminal is on
-  screen at that size (IPC tag `Visibility=26`).
-- `ESC ] 1337 ; ZMX_HIDDEN=<rows>,<cols> BEL` — this client's terminal is not
-  being displayed.
+- `ESC ] 1337 ; ZMX_REFRESH BEL`: repaint this client; leadership-neutral.
+- `ESC ] 1337 ; ZMX_VISIBLE=<rows>,<cols> BEL`: terminal on screen at this size.
+- `ESC ] 1337 ; ZMX_CHAT=<rows>,<cols> BEL`: chat on screen, claiming a wide resting grid.
+- `ESC ] 1337 ; ZMX_HIDDEN=<rows>,<cols> BEL`: parked for any other reason, no chat claim.
 
-Grid policy: only a terminal somebody is looking at may size the pty. A fresh
-attach is displaying and becomes leader at once; a visible claim takes
-leadership and applies its size; a hidden claim drops the client out of
-leadership and re-elects the most recently active displayed client. When only
-hidden clients (or none) remain, the grid rests at `RESTING_GRID_COLS` (200
-columns, `src/ipc.zig`) by the freshest known rows (50 at headless spawn).
-Typing from a hidden client clears its hidden flag; `zmx send` never changes
-leadership.
+Only a visible terminal may size the PTY, with the most recently active client
+winning. A fresh attach and user input count as visible. With no visible client,
+a chat claim widens the grid to at least `RESTING_GRID_COLS` (200), using the
+freshest parked client's rows. Without either claim, the grid stays unchanged.
+Dropping a chat claim never narrows an unattended grid. Headless sessions start
+at 50x200. Background or non-selected chat tabs hold no claim.
 
-`zmx grid <name>` (IPC tag `GridInfo=27`) prints the daemon's current grid,
-leader, resting size, and attached clients as JSON for debugging.
+Both non-visible states pin their local emulator to 200 columns because another
+client's chat claim may widen the daemon. Once visibility is announced, all
+subsequent grid changes must use visibility OSCs; bare SIGWINCH/Resize is ignored
+for that client so local parking cannot race ahead and widen the shared PTY.
+Plain attach clients continue to size through SIGWINCH. `zmx send` never changes leadership.
+`zmx grid <name>` prints the grid, leader, resting size, `chat_claim`, and each
+client's `state` (`visible`, `chat`, `parked`) as JSON.
 
 ## a smol contract
 
