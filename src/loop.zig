@@ -628,6 +628,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
                         .LabelClear => try daemon.handleLabelClear(gpa, client),
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
+                        .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Refresh => try daemon.handleRefresh(gpa, client, &term),
                         .RefreshIfStale => try daemon.handleRefreshIfStale(gpa, client, pty_fd, &term, msg.payload),
@@ -1715,6 +1716,23 @@ pub const Daemon = struct {
             try ipc.appendMessage(gpa, &client.write_buf, .History, "");
             client.has_pending_output = true;
         }
+    }
+
+    pub fn handleCapture(
+        self: *Daemon,
+        gpa: std.mem.Allocator,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.Capture)) return;
+        const request = std.mem.bytesToValue(ipc.Capture, payload);
+        const format = std.enums.fromInt(util.HistoryFormat, request.format) orelse return;
+        self.setPwd(term);
+        const output = util.serializeTerminalRange(gpa, term, format, request.rows);
+        defer if (output) |text| gpa.free(text);
+        try ipc.appendMessage(gpa, &client.write_buf, .Capture, output orelse "");
+        client.has_pending_output = true;
     }
 
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {

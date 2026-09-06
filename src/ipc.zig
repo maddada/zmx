@@ -90,6 +90,11 @@ pub const Tag = enum(u8) {
     /// whose payload is one JSON object (no trailing newline) describing the
     /// grid and leadership state. See `Daemon.handleGridInfo`.
     GridInfo = 27,
+    /// Scoped history: the active screen plus a bounded number of
+    /// preceding scrollback rows. Request payload is `Capture`; old daemons
+    /// drop it via the `_` arm, so clients send `Info` right after it as an
+    /// ordering barrier and treat an `Info` reply before `Capture` as "too old".
+    Capture = 28,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -151,6 +156,14 @@ pub const Visibility = struct {
 };
 
 pub const VISIBILITY_WIRE_LEN = 1 + @sizeOf(Resize);
+
+/// Request payload for `Tag.Capture`. `format` is a `util.HistoryFormat`
+/// and `rows` is how many scrollback rows to include above the active
+/// screen; zero returns only the screen.
+pub const Capture = packed struct {
+    format: u8,
+    rows: u32,
+};
 
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
@@ -557,7 +570,7 @@ test "Ghostex fork Tag wire values are frozen" {
         .{ Tag.TitleObserved, 21 },          .{ Tag.RefreshIfStale, 22 },
         .{ Tag.PromptEditorCapability, 23 }, .{ Tag.SendAcked, 24 },
         .{ Tag.SendAck, 25 },                .{ Tag.Visibility, 26 },
-        .{ Tag.GridInfo, 27 },
+        .{ Tag.GridInfo, 27 },               .{ Tag.Capture, 28 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
