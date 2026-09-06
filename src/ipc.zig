@@ -35,7 +35,14 @@ const lib_posix = @import("posix.zig");
 /// Generation 1 is the contract of tags 0-27 as of 2026-09-03 and every
 /// binary since the 2026-08-23 tag renumbering, which is why gxserver treats
 /// its older binary-identity stamps as generation 1.
-pub const WIRE_GENERATION: u32 = 1;
+///
+/// History:
+///   1 (2026-08-23): fork tags renumbered 14-18 -> 19-23 after upstream claimed
+///     14-18 for labels and Send.
+///   2 (2026-09-06): fork tags moved 19-28 -> 200-209 so upstream's
+///     EnvGet/EnvSet/EnvData (19-21) merge in at their own numbers. Payloads
+///     and the Ghostex OSC emitters are unchanged.
+pub const WIRE_GENERATION: u32 = 2;
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -57,16 +64,21 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
+    EnvGet = 19,
+    EnvSet = 20,
+    EnvData = 21,
     // === Ghostex fork tags ===
-    // Upstream owns 0-18. The fork's five tags used to live at 14-18 and were
-    // renumbered to 19-23 when upstream claimed 14-18 for labels and Send.
-    // This is a deliberate wire break against pre-renumber Ghostex daemons:
-    // they must be cycled, not upgraded in place.
-    Refresh = 19,
-    TitleSubscribe = 20,
-    TitleObserved = 21,
-    RefreshIfStale = 22,
-    PromptEditorCapability = 23,
+    // CDXC:ZmxWireGeneration 2026-09-06 DECISION:
+    // Upstream owns the low range and keeps claiming it (14-18 for labels and
+    // Send, then 19-21 for tracked env vars, each time colliding with fork
+    // tags parked just above). The fork's tags now live at 200 and up so an
+    // upstream merge never renumbers them again. User accepted the wire break
+    // this move implies: every live daemon is cycled at the next install.
+    Refresh = 200,
+    TitleSubscribe = 201,
+    TitleObserved = 202,
+    RefreshIfStale = 203,
+    PromptEditorCapability = 204,
     /// Like `Send`, but the daemon answers with `SendAck` once it has decided
     /// what to do with the payload. Added 2026-08-24 so `zmx send` can stop
     /// reporting success for bytes that never reached the pty queue.
@@ -77,24 +89,24 @@ pub const Tag = enum(u8) {
     /// connection. That is exactly why `sendToSessionPty` pings with an
     /// EMPTY `SendAcked` first and only commits the real payload to this tag
     /// after a `SendAck` proves the daemon understands it.
-    SendAcked = 24,
+    SendAcked = 205,
     /// Daemon -> client receipt for `SendAcked`. Payload is one byte holding
     /// a `SendAckStatus`.
-    SendAck = 25,
+    SendAck = 206,
     /// Client -> daemon: "my terminal is (not) being looked at, and this is
     /// its size". Payload is `VISIBILITY_WIRE_LEN` bytes (see `Visibility`).
     /// Added 2026-09-03 (CDXC:Zmx) so only a terminal someone is
     /// looking at may size the pty; old daemons drop it via the `_` arm.
-    Visibility = 26,
+    Visibility = 207,
     /// Client -> daemon request with an empty payload; daemon -> client reply
     /// whose payload is one JSON object (no trailing newline) describing the
     /// grid and leadership state. See `Daemon.handleGridInfo`.
-    GridInfo = 27,
+    GridInfo = 208,
     /// Scoped history: the active screen plus a bounded number of
     /// preceding scrollback rows. Request payload is `Capture`; old daemons
     /// drop it via the `_` arm, so clients send `Info` right after it as an
     /// ordering barrier and treat an `Info` reply before `Capture` as "too old".
-    Capture = 28,
+    Capture = 209,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -117,6 +129,10 @@ pub const Resize = packed struct {
     cols: u16,
     xpixel: u16 = 0,
     ypixel: u16 = 0,
+
+    pub fn winsize(self: Resize) cross.c.struct_winsize {
+        return .{ .ws_row = self.rows, .ws_col = self.cols, .ws_xpixel = self.xpixel, .ws_ypixel = self.ypixel };
+    }
 };
 
 /// CDXC:Zmx 2026-09-03: grid the daemon rests at when no
@@ -241,6 +257,23 @@ pub fn appendMessage(
     if (data.len > 0) {
         list.appendSliceAssumeCapacity(data);
     }
+}
+
+/// Pre-0.7.0 daemons expect a 4-byte Init/Resize payload (rows+cols, no
+/// pixel size) and silently drop the 8-byte form, hanging `zmx attach`
+/// against a running old daemon (#211). Append both encodings: every daemon
+/// drops the length it doesn't expect and processes the other exactly once.
+pub const LEGACY_RESIZE_LEN = 4;
+
+pub fn appendSizeMessage(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    tag: Tag,
+    size: Resize,
+) !void {
+    const bytes = std.mem.asBytes(&size);
+    try appendMessage(alloc, list, tag, bytes);
+    try appendMessage(alloc, list, tag, bytes[0..LEGACY_RESIZE_LEN]);
 }
 
 fn writeAll(fd: i32, data: []const u8) !void {
@@ -560,17 +593,18 @@ test "Tag wire values are frozen" {
         .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
         .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },
+        .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
+        .{ Tag.EnvData, 21 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
 test "Ghostex fork Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Refresh, 19 },                .{ Tag.TitleSubscribe, 20 },
-        .{ Tag.TitleObserved, 21 },          .{ Tag.RefreshIfStale, 22 },
-        .{ Tag.PromptEditorCapability, 23 }, .{ Tag.SendAcked, 24 },
-        .{ Tag.SendAck, 25 },                .{ Tag.Visibility, 26 },
-        .{ Tag.GridInfo, 27 },               .{ Tag.Capture, 28 },
+        .{ Tag.Refresh, 200 },                .{ Tag.TitleSubscribe, 201 },
+        .{ Tag.TitleObserved, 202 },          .{ Tag.RefreshIfStale, 203 },
+        .{ Tag.PromptEditorCapability, 204 }, .{ Tag.SendAcked, 205 },
+        .{ Tag.SendAck, 206 },                .{ Tag.Visibility, 207 },
+        .{ Tag.GridInfo, 208 },               .{ Tag.Capture, 209 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 
@@ -616,6 +650,30 @@ pub fn roundTripForTag(
         }
     }
     return error.Unexpected;
+}
+
+test "appendSizeMessage emits current and legacy encodings" {
+    const alloc = std.testing.allocator;
+    var list = try std.ArrayList(u8).initCapacity(alloc, 64);
+    defer list.deinit(alloc);
+
+    const size = Resize{ .rows = 45, .cols = 170, .xpixel = 900, .ypixel = 1800 };
+    try appendSizeMessage(alloc, &list, .Init, size);
+
+    const h1 = std.mem.bytesToValue(Header, list.items[0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h1.tag);
+    try std.testing.expectEqual(@as(u32, @sizeOf(Resize)), h1.len);
+    const p1 = list.items[@sizeOf(Header)..][0..@sizeOf(Resize)];
+    try std.testing.expectEqual(size, std.mem.bytesToValue(Resize, p1));
+
+    const off2 = @sizeOf(Header) + @sizeOf(Resize);
+    const h2 = std.mem.bytesToValue(Header, list.items[off2..][0..@sizeOf(Header)]);
+    try std.testing.expectEqual(Tag.Init, h2.tag);
+    try std.testing.expectEqual(@as(u32, LEGACY_RESIZE_LEN), h2.len);
+    // Legacy payload is the rows+cols prefix of the current encoding.
+    const p2 = list.items[off2 + @sizeOf(Header) ..][0..LEGACY_RESIZE_LEN];
+    try std.testing.expectEqualSlices(u8, p1[0..LEGACY_RESIZE_LEN], p2);
+    try std.testing.expectEqual(off2 + @sizeOf(Header) + LEGACY_RESIZE_LEN, list.items.len);
 }
 
 test "zeroed Info has no stack garbage in wire bytes" {

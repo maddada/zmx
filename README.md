@@ -34,10 +34,10 @@
 
 ### binaries
 
-- https://zmx.sh/a/zmx-0.7.0-linux-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-linux-x86_64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-aarch64.tar.gz
-- https://zmx.sh/a/zmx-0.7.0-macos-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-linux-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-linux-x86_64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-macos-aarch64.tar.gz
+- https://zmx.sh/a/zmx-0.8.1-macos-x86_64.tar.gz
 
 ### homebrew
 
@@ -107,11 +107,11 @@ Commands:
   [p]rint <name> <text...>                 Inject text into session display
   [wr]ite <name> <file_path>               Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
-  [l]ist|ls [--short|--where k=v]          List active sessions
+  [l]ist|ls [--short]                      List active sessions
   [g]et <name>                             Get session labels
   set <name> k=v ...                       Set session labels
-  [un]set <name> key ...                   Remove session labels
   [cl]ear <name>                           Clear all session labels
+  print-env [-s] <name> [key]              Print tracked environment variables
   [k]ill <name>... [--force]               Kill session and all attached clients
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
@@ -134,14 +134,9 @@ is too old.
 
 ## nested sessions
 
-Nested sessions are not supported. Inside a session `ZMX_SESSION` is set, and
-`attach` reads it: instead of creating another client it switches the calling
-terminal to the session you named.
+Nested sessions are not supported. Inside a session `ZMX_SESSION` is set, and `attach` reads it: instead of creating another client it switches the calling terminal to the session you named.
 
-That matters when the variable is inherited rather than chosen. A script, build
-tool, or coding agent started inside a session runs with `ZMX_SESSION` set, so
-`zmx attach other` from there moves the terminal somebody was using, and the
-session it was showing is left with no client.
+That matters when the variable is inherited rather than chosen. A script, build tool, or coding agent started inside a session runs with `ZMX_SESSION` set, so `zmx attach other` from there moves the terminal somebody was using, and the session it was showing is left with no client.
 
 Unset it in anything that attaches on its own behalf:
 
@@ -225,6 +220,89 @@ symbol = " "
 format = "[$symbol$env_value]($style) "
 description = "zmx session name"
 style = "bold magenta"
+```
+
+## environment variables
+
+A session's environment is initialized when the session is created. When re-attaching from a new terminal or a different SSH connection, environment variables describing the client connection (such as `SSH_AUTH_SOCK`, `DISPLAY`, or terminal remote control variables like `KITTY_LISTEN_ON`, `KITTY_PID`, `KITTY_WINDOW_ID`) become outdated in the running shell.
+
+`zmx` tracks these environment variables from attaching clients. You can inspect the current leader client's environment with `zmx print-env`:
+
+```bash
+# Print all tracked environment variables (set variables as KEY=VALUE, unset as -KEY)
+zmx print-env .
+zmx print-env dev
+
+# Print POSIX shell commands (export ... / unset ...) suitable for eval
+zmx print-env -s .
+
+# Print a specific variable value
+zmx print-env . SSH_AUTH_SOCK
+```
+
+You can automatically update your shell environment before each prompt:
+
+### bash
+
+Add to `~/.bashrc`:
+
+```bash
+_zmx_env_hook() {
+  if [[ -n $ZMX_SESSION ]]; then
+    eval "$(zmx print-env -s .)"
+  fi
+}
+PROMPT_COMMAND="_zmx_env_hook${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+```
+
+### zsh
+
+Add to `~/.zshrc`:
+
+```zsh
+precmd() {
+  if [[ -n $ZMX_SESSION ]]; then
+    eval "$(zmx print-env -s .)"
+  fi
+}
+```
+
+### fish
+
+Add to `~/.config/fish/config.fish`:
+
+```fish
+function _zmx_env_hook --on-event fish_prompt
+  if test -n "$ZMX_SESSION"
+    for line in (zmx print-env .)
+      if string match -q -- "-*" $line
+        set -e (string sub -s 2 $line)
+      else
+        set -gx (string split -m 1 "=" $line)
+      end
+    end
+  end
+end
+```
+
+### configuring tracked variables
+
+By default, `zmx` tracks:
+
+- `DISPLAY`
+- `SSH_AUTH_SOCK`
+- `SSH_AGENT_PID`
+- `SSH_CONNECTION`
+- `WINDOWID`
+- `XAUTHORITY`
+- `KITTY_LISTEN_ON`
+- `KITTY_PID`
+- `KITTY_WINDOW_ID`
+
+You can customize this list by setting `ZMX_TRACK_ENV` to a comma-separated list of variable names:
+
+```bash
+export ZMX_TRACK_ENV="DISPLAY,SSH_AUTH_SOCK,GPG_AGENT_INFO"
 ```
 
 ## shell completion
@@ -572,3 +650,4 @@ abduco provides session management (i.e. it allows programs to be run independen
 - [zsm](https://github.com/mdsakalu/zmx-session-manager) -- TUI session manager for zmx. List, preview, filter, and kill sessions from an interactive terminal UI.
 - [zmosh](https://github.com/mmonad/zmosh) -- A fork of zmx that adds encrypted UDP auto-reconnect for remote sessions (like mosh).
 - [zmx-picker](https://github.com/EarthmanMuons/zmx-picker) -- fzf-based session picker and project launcher. Jump to a running zmx session or start one inside any of your git/jj repos.
+- [rootshell](https://github.com/kitknox/rootshell) -- Metal-accelerated terminal for iPhone, iPad, Vision Pro, and Mac. Lists active zmx sessions with live previews and can auto-attach on connect.
