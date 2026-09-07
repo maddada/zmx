@@ -768,6 +768,9 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     writeDynamicColor(writer, .cursor, colors.cursor);
 }
 
+/// CDXC:Zmx 2026-09-07 WHY:
+/// Replay must preserve soft wraps so later resizes can reflow them; the formatter's default inserts hard newlines at every physical row.
+/// Emit unwrapped content with autowrap enabled, then restore the application's mode after replay, including when the application disabled wrapping before the snapshot.
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
@@ -781,6 +784,15 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+
+    defer if (had_synchronized_output) {
+        term.modes.set(.synchronized_output, true);
+    };
+
+    const had_wraparound = term.modes.get(.wraparound);
+    term.modes.set(.wraparound, true);
+    defer term.modes.set(.wraparound, had_wraparound);
+    builder.writer.writeAll("\x1b[?7h") catch return null;
 
     // If state contains color override, restore it.
     writeColorOverrides(&builder.writer, term);
@@ -809,6 +821,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             sb_bottom.x = @intCast(pages.cols - 1);
 
             var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+            scroll_fmt.opts.unwrap = true;
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
                     screen_top,
@@ -830,6 +843,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
     var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    vis_fmt.opts.unwrap = true;
 
     // Restrict content to the active viewport only
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
@@ -866,6 +880,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         return null;
     };
 
+    if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
 
     // The formatter has no title extra and never emits OSC 0/1/2, so the title
@@ -880,11 +895,6 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
@@ -914,9 +924,15 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
         term.modes.set(.synchronized_output, true);
     };
 
+    const had_wraparound = term.modes.get(.wraparound);
+    term.modes.set(.wraparound, true);
+    defer term.modes.set(.wraparound, had_wraparound);
+    builder.writer.writeAll("\x1b[?7h") catch return null;
+
     builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
 
     var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
+    vis_fmt.opts.unwrap = true;
     const pages = &term.screens.active.pages;
     const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
     const active_br = pages.pin(.{
@@ -950,6 +966,7 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
         return null;
     };
 
+    if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
 
     const output = builder.writer.buffered();
