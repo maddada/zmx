@@ -13,6 +13,7 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const client_detach = @import("client_detach.zig");
 
 /// Prompt-editor capability bits advertised by an attaching client on .Init.
 pub const prompt_editor_capability_monaco: u8 = 1;
@@ -188,6 +189,9 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
 
     var stdout_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     defer stdout_buf.deinit(gpa);
+    var graceful_detach: client_detach.State = .{};
+    defer graceful_detach.finish();
+    try stdout_buf.appendSlice(gpa, client_detach.capability);
 
     const stdin_fd = lib_posix.STDIN_FILENO;
 
@@ -254,7 +258,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try appendClientInputMessages(gpa, &sock_write_buf, buf[0..n]);
+                        try graceful_detach.append(gpa, &sock_write_buf, buf[0..n], appendClientInputMessages);
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -277,11 +281,13 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
             if (n == 0) {
                 std.log.info("server closed connection", .{});
                 // Server closed connection
+                graceful_detach.peerClosed(sock_write_buf.items.len == 0);
                 return ClientResult{ .kind = .detach, .session_name = null };
             }
 
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
+                    .Info => try graceful_detach.barrierReply(gpa, &sock_write_buf),
                     .Output => {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(gpa, msg.payload);
@@ -340,6 +346,9 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
 
         if (poll_fds.items[1].revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
             std.log.info("poll hup|err|nval", .{});
+            if (poll_fds.items[1].revents & (lib_posix.POLL.ERR | lib_posix.POLL.NVAL) == 0) {
+                graceful_detach.peerClosed(sock_write_buf.items.len == 0);
+            }
             return ClientResult{ .kind = .detach, .session_name = null };
         }
     }
