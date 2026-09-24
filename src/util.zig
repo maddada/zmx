@@ -944,6 +944,14 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
     const had_wraparound = term.modes.get(.wraparound);
     term.modes.set(.wraparound, true);
     defer term.modes.set(.wraparound, had_wraparound);
+    // CDXC:Zmx 2026-09-24 WHY:
+    // The refresh is wrapped in synchronized output (DECSET 2026) begin/end so
+    // the receiving terminal defers painting until the whole dump is applied.
+    // Without the markers a dump fed across multiple reads paints intermediate
+    // chunk states, which reads as a flicker of older screens on every client
+    // whose painter honors the mode; painters that do not honor it are
+    // unaffected (they ignore the private mode, as before).
+    builder.writer.writeAll("\x1b[?2026h") catch return null;
     builder.writer.writeAll("\x1b[?7h") catch return null;
 
     builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
@@ -985,6 +993,7 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
+    builder.writer.writeAll("\x1b[?2026l") catch return null;
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
