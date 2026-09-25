@@ -945,12 +945,8 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
     term.modes.set(.wraparound, true);
     defer term.modes.set(.wraparound, had_wraparound);
     // CDXC:Zmx 2026-09-24 WHY:
-    // The refresh is wrapped in synchronized output (DECSET 2026) begin/end so
-    // the receiving terminal defers painting until the whole dump is applied.
-    // Without the markers a dump fed across multiple reads paints intermediate
-    // chunk states, which reads as a flicker of older screens on every client
-    // whose painter honors the mode; painters that do not honor it are
-    // unaffected (they ignore the private mode, as before).
+    // The refresh carries its own synchronized-output pair (DECSET 2026 set here, reset as the last bytes below), so a terminal that honors the mode paints the finished dump once instead of the intermediate states of a dump that arrives over several reads (a flash of older screens on every grid change). Unlike replaying the program's open handshake above, this pair closes inside the same message; terminals that ignore the private mode are unaffected.
+    // SEE-ALSO: apps/desktop/src/terminal_element.rs `synchronized_output_since` (Ghostex defers painting while the mode is set); wmx sends its refresh snapshot with the same pair.
     builder.writer.writeAll("\x1b[?2026h") catch return null;
     builder.writer.writeAll("\x1b[?7h") catch return null;
 
