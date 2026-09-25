@@ -944,6 +944,10 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
     const had_wraparound = term.modes.get(.wraparound);
     term.modes.set(.wraparound, true);
     defer term.modes.set(.wraparound, had_wraparound);
+    // CDXC:Zmx 2026-09-24 WHY:
+    // The refresh carries its own synchronized-output pair (DECSET 2026 set here, reset as the last bytes below), so a terminal that honors the mode paints the finished dump once instead of the intermediate states of a dump that arrives over several reads (a flash of older screens on every grid change). Unlike replaying the program's open handshake above, this pair closes inside the same message; terminals that ignore the private mode are unaffected.
+    // SEE-ALSO: apps/desktop/src/terminal_element.rs `synchronized_output_since` (Ghostex defers painting while the mode is set); wmx sends its refresh snapshot with the same pair.
+    builder.writer.writeAll("\x1b[?2026h") catch return null;
     builder.writer.writeAll("\x1b[?7h") catch return null;
 
     builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
@@ -985,6 +989,7 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
+    builder.writer.writeAll("\x1b[?2026l") catch return null;
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
