@@ -1380,7 +1380,6 @@ pub const Daemon = struct {
                 return;
             }
         }
-        return error.NoLeaderFound;
     }
 
     /// Resize the PTY and the daemon's own terminal to `resize`.
