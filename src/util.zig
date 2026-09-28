@@ -751,6 +751,46 @@ pub fn isUserInput(payload: []const u8) bool {
 /// The NUL is not cosmetic: a client that records what it receives (kitty
 /// writing its session file, for one) persists the NUL and then fails to parse
 /// its own state back. See https://github.com/neurosnap/zmx/issues/222.
+/// CDXC:Zmx 2026-09-29 WHY:
+/// A client that attached while a full-screen TUI held the alternate screen (Codex's fullscreen view, its default since 0.157, or Claude Code) received only that grid, so its primary screen came up empty: the shell history from before the TUI was gone from that client, which showed a blank terminal once the TUI quit. The primary screen's history, grid and cursor are written first, the way ghostty's formatter documents replaying every screen; the active-screen replay that follows enters the alternate screen with `?1049h`, which saves exactly this cursor for the TUI's exit to restore. wmx cannot do the same: its vt100 grid exposes only the active screen.
+fn writePrimaryBehindAlternate(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
+    const primary = term.screens.get(.primary) orelse return;
+    const pages = &primary.pages;
+    const screen_top = pages.getTopLeft(.screen);
+    const active_top = pages.getTopLeft(.active);
+    if (!screen_top.eql(active_top)) {
+        if (active_top.up(1)) |sb_bottom_row| {
+            var sb_bottom = sb_bottom_row;
+            sb_bottom.x = @intCast(pages.cols - 1);
+            var scroll_fmt = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
+            scroll_fmt.opts.unwrap = true;
+            scroll_fmt.content = .{
+                .selection = ghostty_vt.Selection.init(screen_top, sb_bottom, false),
+            };
+            try scroll_fmt.format(writer);
+        }
+        // Same two-phase contract as the active screen's replay below.
+        for (0..pages.rows) |_| try writer.writeAll("\r\n");
+        try writer.writeAll("\x1b[2J\x1b[H\x1b[0m");
+    }
+    const top_left = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return;
+    const bottom_right = pages.pin(.{ .active = .{
+        .x = @intCast(pages.cols - 1),
+        .y = @intCast(pages.rows - 1),
+    } }) orelse return;
+    var grid_fmt = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
+    grid_fmt.opts.unwrap = true;
+    grid_fmt.content = .{
+        .selection = ghostty_vt.Selection.init(top_left, bottom_right, false),
+    };
+    grid_fmt.extra = .none;
+    grid_fmt.extra.cursor = true;
+    try grid_fmt.format(writer);
+    // Enter now, saving the cursor just placed, and home: the replay's own `?1049h`
+    // then finds the alternate screen active and leaves the cursor where its grid starts.
+    try writer.writeAll("\x1b[0m\x1b[?1049h\x1b[H");
+}
+
 fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
     const pwd = term.getPwd() orelse return;
     if (pwd.len == 0) return;
@@ -856,6 +896,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
         // SGR style so phase 1 styles don't bleed into phase 2.
         builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+    }
+
+    if (term.screens.active_key == .alternate) {
+        writePrimaryBehindAlternate(&builder.writer, term) catch return null;
     }
 
     // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
