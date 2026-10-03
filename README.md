@@ -25,6 +25,66 @@
 - Works on mac and linux
 - This project does **NOT** provide windows, tabs, or splits
 
+## Kitty image restoration (local candidate)
+
+Fresh attachments replay static Kitty RGB/RGBA assets with explicit image IDs,
+including decoded PNGs, ordinary pinned placements, Unicode-placeholder (`U=1`)
+placements, mixed placements and retained unplaced assets. PNGs use Ghostty's
+pinned Wuffs decoder. Base64 payloads are chunked to 4096 bytes and every
+command suppresses replies. Ordinary history pins are placed while their row
+is still addressable. Primary state is restored before an active alternate
+screen. An inactive alternate buffer is not reconstructed on primary attach.
+
+In-place refresh clears text with ED0 and emits no image commands. This keeps
+ordinary, virtual and straddling history placements alive without duplicating
+internal placement IDs or replacing retained pixels. The viewport is formatted
+before application modes, margins and cursor state are restored. Grapheme
+clustering mode is restored before any text because it changes cell widths.
+As with the existing text snapshot, history printed under differing grapheme
+clustering modes is replayed using the final global mode. Retained text can be
+identical while historical cell widths differ. Arbitrary saved cursor slots
+are also outside the snapshot contract.
+
+Replay is limited to 4096 on each side, 4 Mi pixels per image, 16 MiB of decoded
+pixel bytes per screen, and 4096 eligible assets/placements. Exceeding an entry
+cap omits that screen's image replay. Within the byte budget, visible/virtual
+assets take priority over history and unplaced assets, followed by image ID.
+The replay borrows Ghostty's retained state synchronously; it stores no raw
+escape history. Original explicit image and placement IDs are preserved;
+internal placement IDs are assigned by the receiving parser.
+
+Relative placements, animation state, pending data, numbered (`I=`) and implicit
+image identities are not reconstructed. Explicit replay cannot preserve a
+number alias or the implicit allocator counter. The decoder rejects PNG input
+above 16 MiB after buffering and applies the same dimension/pixel bounds. The
+core's existing transmission/decompression ceiling remains 400 MiB; decoded
+replay limits do not bound all in-flight storage. Raw image storage and transmission
+permissions are unchanged. Rejected PNG input is still passed live to the
+client but has no retained daemon asset for a future attachment.
+
+This candidate is verified on macOS arm64. Linux runtime behavior is unverified.
+Windows uses wmx, whose vt100 parser retains no Kitty graphics state; replay
+there requires a separate parser/state design and native ConPTY verification.
+The existing IPC tags and Init payload are unchanged. An optional `GridSync`
+tag (210) advertises ordered resize records; wire generation remains 2. A
+nonce-enabled attach sends the empty advertisement before Init. The daemon
+queues grid/pixel dimensions after each actual resize and before later output,
+including an initial baseline for sessions that have not emitted text.
+Unchanged claims emit no record or repaint; initial attachment supplies a
+baseline even if no resize is needed. Existing automatic refresh
+remains after the record and preserves an open program synchronized update.
+
+The native Ghostex adapter opts in only for local POSIX agent viewers. It removes
+fixed nonce-scoped records before feeding Ghostty, so even a record between
+UTF-8, CSI or graphics bytes cannot interrupt the VT parser. The token is removed
+before session creation and excluded from tracked environment variables; it
+belongs to one attach generation, not the program or daemon. Only negotiated
+viewers defer their VT resize until the daemon's ordered record. Old daemons
+ignore the new tag, receive the existing Init, and leave the host on immediate
+resize/refresh behavior. Non-advertising clients receive no records. No session
+restart is forced; an older daemon needs natural replacement for new replay.
+Remote viewers, browser/mobile clients and wmx remain on their existing path.
+
 ## demos
 
 - [zmx - intro](https://youtu.be/UIXj0_rhPgI)

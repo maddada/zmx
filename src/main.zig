@@ -14,6 +14,7 @@ const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
 const loop = @import("loop.zig");
+const kitty_replay = @import("kitty_replay.zig");
 const Client = loop.Client;
 const Daemon = loop.Daemon;
 const version = build_options.version;
@@ -45,6 +46,10 @@ pub fn main(init: std.process.Init) !void {
     // write() can return BrokenPipe. Inherited across fork, so this also
     // covers the daemon.
     signal.ignoreSigpipe();
+
+    // ghostty-vt ships without a PNG decoder, which made the daemon drop every
+    // f=100 transmission; set before any terminal exists, and so before fork.
+    ghostty_vt.sys.decode_png = &kitty_replay.decodePng;
 
     var args = init.minimal.args.iterate();
     defer args.deinit();
@@ -211,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
             parsed.labels,
             parsed.require_existing,
             parsed.prompt_editor_capabilities,
+            init.environ_map.get("GHOSTEX_ZMX_GRID_NONCE"),
         );
     } else if (std.mem.eql(u8, cmd, "prompt-editor-capability")) {
         var session_name: ?[]const u8 = null;
@@ -1386,7 +1392,8 @@ fn getTrackedEnvStr(
     var iter = std.mem.splitScalar(u8, env_keys, ',');
     while (iter.next()) |entry| {
         const env = std.mem.trim(u8, entry, " \t\r\n");
-        if (env.len == 0) continue;
+        if (env.len == 0 or std.mem.eql(u8, env, "GHOSTEX_ZMX_GRID_NONCE") or
+            std.mem.eql(u8, env, "GHOSTEX_ZMX_GRID_SYNC")) continue;
         if (env_map.get(env)) |val| {
             try out.appendSlice(alloc, env);
             try out.append(alloc, '=');
@@ -1791,7 +1798,11 @@ fn attach(
     labels: ?[]const u8,
     require_existing: bool,
     prompt_editor_capabilities: u8,
+    grid_nonce: ?[]const u8,
 ) !void {
+    // This token belongs to the outer attach, never its daemon or session
+    // shell. Keep the stable Environ.Map copy for an in-process Switch.
+    _ = cross.c.unsetenv("GHOSTEX_ZMX_GRID_NONCE");
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(gpa, io, daemon, sesh);
@@ -1865,7 +1876,7 @@ fn attach(
     const clear_seq = "\x1b[2J\x1b[H";
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
-    const looper = try loop.clientLoop(client_sock, env_str, prompt_editor_capabilities);
+    const looper = try loop.clientLoop(client_sock, env_str, prompt_editor_capabilities, grid_nonce);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -1902,6 +1913,7 @@ fn attach(
                     null,
                     require_existing,
                     prompt_editor_capabilities,
+                    grid_nonce,
                 );
             }
         },

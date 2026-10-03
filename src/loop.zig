@@ -88,7 +88,7 @@ fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
 /// request through the attached terminal because that path is already connected
 /// to the correct zmx client. zmx must consume that exact sequence locally and
 /// convert it to Refresh IPC so the shell/PTY never receives the control bytes.
-fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
+fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8, include_pixels: bool) !void {
     var remaining = input;
     while (std.mem.indexOf(u8, remaining, ghostex_osc_prefix)) |index| {
         const tail = remaining[index..];
@@ -100,12 +100,17 @@ fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayL
         }
         switch (parseGhostexOscBody(tail[ghostex_osc_prefix.len..bel])) {
             .refresh => try ipc.appendMessage(gpa, sock_write_buf, .Refresh, ""),
-            .visibility => |visibility| try ipc.appendMessage(
-                gpa,
-                sock_write_buf,
-                .Visibility,
-                &visibility.encode(),
-            ),
+            .visibility => |visibility| {
+                var claim = visibility;
+                if (include_pixels) {
+                    const size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
+                    if (size.rows == claim.resize.rows and size.cols == claim.resize.cols) {
+                        claim.resize.xpixel = size.xpixel;
+                        claim.resize.ypixel = size.ypixel;
+                    }
+                }
+                try ipc.appendMessage(gpa, sock_write_buf, .Visibility, &claim.encode());
+            },
             .malformed => std.log.warn("dropping malformed Ghostex OSC len={d}", .{bel + 1}),
         }
         remaining = tail[bel + 1 ..];
@@ -120,7 +125,7 @@ test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
 
-    try appendClientInputMessages(alloc, &out, "before" ++ ghostex_refresh_sequence ++ "after");
+    try appendClientInputMessages(alloc, &out, "before" ++ ghostex_refresh_sequence ++ "after", false);
 
     var offset: usize = 0;
     const first_header = std.mem.bytesToValue(ipc.Header, out.items[offset..][0..@sizeOf(ipc.Header)]);
@@ -142,7 +147,7 @@ test "appendClientInputMessages converts Ghostex refresh OSC to Refresh IPC" {
     try std.testing.expectEqualStrings("after", out.items[offset..][0..second_len]);
 }
 
-pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabilities: u8) !ClientResult {
+pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabilities: u8, attach_nonce: ?[]const u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .Debug) {
@@ -171,6 +176,25 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
     if (env_str.len > 0) {
         try ipc.appendMessage(gpa, &sock_write_buf, .EnvSet, env_str);
     }
+
+    const grid_nonce = blk: {
+        const value = attach_nonce orelse break :blk null;
+        if (value.len != 32) break :blk null;
+        for (value) |byte| if (!std.ascii.isHex(byte)) break :blk null;
+        break :blk @as(?[]const u8, value);
+    };
+    if (grid_nonce) |nonce| {
+        // A reset belongs to the attach generation, including old daemons.
+        var reset: [64]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&reset, "\x1b_ZMX_GRID;{s};0000000000000000\x1b\\", .{nonce});
+        _ = try lib_posix.write(lib_posix.STDOUT_FILENO, bytes);
+        try ipc.appendMessage(gpa, &sock_write_buf, .GridSync, "");
+    }
+    defer if (grid_nonce) |nonce| {
+        var reset: [64]u8 = undefined;
+        const bytes = std.fmt.bufPrint(&reset, "\x1b_ZMX_GRID;{s};0000000000000000\x1b\\", .{nonce}) catch unreachable;
+        _ = lib_posix.write(lib_posix.STDOUT_FILENO, bytes) catch {};
+    };
 
     // Send init message with terminal size (buffered), plus the client's
     // prompt-editor capability byte. Omitting the byte means "machine editor".
@@ -254,7 +278,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try appendClientInputMessages(gpa, &sock_write_buf, buf[0..n]);
+                        try appendClientInputMessages(gpa, &sock_write_buf, buf[0..n], grid_nonce != null);
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -285,6 +309,16 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
                     .Output => {
                         if (msg.payload.len > 0) {
                             try stdout_buf.appendSlice(gpa, msg.payload);
+                        }
+                    },
+                    .GridSync => {
+                        if (grid_nonce) |nonce| {
+                            if (msg.payload.len != @sizeOf(ipc.Resize)) return error.InvalidGridSync;
+                            const grid = std.mem.bytesToValue(ipc.Resize, msg.payload);
+                            if (grid.rows == 0 or grid.cols == 0) return error.InvalidGridSync;
+                            var marker: [64]u8 = undefined;
+                            const bytes = try std.fmt.bufPrint(&marker, "\x1b_ZMX_GRID;{s};{x:0>4}{x:0>4}{x:0>4}{x:0>4}\x1b\\", .{ nonce, grid.rows, grid.cols, grid.xpixel, grid.ypixel });
+                            try stdout_buf.appendSlice(gpa, bytes);
                         }
                     },
                     .Resize => {
@@ -544,12 +578,16 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        if (client.is_title_watcher) continue;
+                        if (client.is_title_watcher or client.grid_sync_failed) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
                             );
+                            if (client.ordered_grid) {
+                                client.grid_sync_failed = true;
+                                client.has_pending_output = true;
+                            }
                             continue;
                         };
                         client.has_pending_output = true;
@@ -597,6 +635,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             i -= 1;
             const client = daemon.clients.items[i];
             const revents = poll_fds.items[i + 3].revents;
+            if (client.grid_sync_failed) {
+                const last = daemon.closeClient(gpa, client, i, false);
+                if (last) break :daemon_loop;
+                continue;
+            }
 
             if (revents & lib_posix.POLL.IN != 0) {
                 const n = client.read_buf.read(client.socket_fd) catch |err| {
@@ -623,6 +666,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .SendAcked => try daemon.handleSendAcked(gpa, client, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
+                        .GridSync => {
+                            if (msg.payload.len == 0) client.ordered_grid = true;
+                        },
                         .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
@@ -663,6 +709,11 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 }
             }
 
+            if (client.grid_sync_failed) {
+                const last = daemon.closeClient(gpa, client, i, false);
+                if (last) break :daemon_loop;
+                continue;
+            }
             if (revents & lib_posix.POLL.OUT != 0) {
                 // Flush pending output buffers
                 const n = lib_posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
@@ -716,6 +767,8 @@ pub const Client = struct {
     /// Prompt-editor capability bits this client advertised on .Init.
     /// See `prompt_editor_capability_monaco` / `_code_server`.
     prompt_editor_capabilities: u8 = 0,
+    ordered_grid: bool = false,
+    grid_sync_failed: bool = false,
     /// CDXC:Zmx 2026-09-03: the last grid this client reported
     /// (Init, Resize, or Visibility payload). `electLeader` applies it without
     /// a `.Resize` round trip.
@@ -839,17 +892,6 @@ pub const Daemon = struct {
             gpa.destroy(client);
         }
         self.clients.clearRetainingCapacity();
-    }
-
-    /// Resize the daemon's terminal with prompt_redraw disabled. On resize the
-    /// terminal would clear prompt lines expecting the shell to redraw them,
-    /// but the shell's redraw goes to the PTY (forwarded to clients), not to
-    /// this terminal, so the clearing only corrupts our snapshot state.
-    fn resizeTerm(gpa: std.mem.Allocator, term: *ghostty_vt.Terminal, cols: u16, rows: u16) !void {
-        const saved = term.flags.shell_redraws_prompt;
-        term.flags.shell_redraws_prompt = .false;
-        defer term.flags.shell_redraws_prompt = saved;
-        try term.resize(gpa, .{ .cols = cols, .rows = rows });
     }
 
     /// True while a client that sent .Init (a real `zmx attach`) is connected.
@@ -1103,6 +1145,8 @@ pub const Daemon = struct {
         return .{
             .rows = @intCast(term.screens.active.pages.rows),
             .cols = @intCast(term.screens.active.pages.cols),
+            .xpixel = @intCast(@min(term.width_px, std.math.maxInt(u16))),
+            .ypixel = @intCast(@min(term.height_px, std.math.maxInt(u16))),
         };
     }
 
@@ -1110,9 +1154,9 @@ pub const Daemon = struct {
     /// already the grid. Returns whether anything changed.
     fn applyGridIfChanged(self: *Daemon, gpa: std.mem.Allocator, resize: ipc.Resize) !bool {
         const term = self.term orelse return false;
-        const current = currentGrid(term);
-        if (current.rows == resize.rows and current.cols == resize.cols) return false;
-        try self.applyTerminalResize(gpa, self.pty_fd, term, resize);
+        if (!try self.resizeOrderedTerm(gpa, term, resize)) return false;
+        var ws = resize.winsize();
+        _ = cross.c.ioctl(self.pty_fd, cross.c.TIOCSWINSZ, &ws);
         return true;
     }
 
@@ -1382,21 +1426,49 @@ pub const Daemon = struct {
         }
     }
 
-    /// Resize the PTY and the daemon's own terminal to `resize`.
-    ///
-    /// Extracted from handleInit/handleResize because handleRefreshIfStale
-    /// needs the same sequence from a third call site.
-    fn applyTerminalResize(
-        self: *Daemon,
-        gpa: std.mem.Allocator,
-        pty_fd: i32,
-        term: *ghostty_vt.Terminal,
-        resize: ipc.Resize,
-    ) !void {
+    fn appendGrid(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) void {
         _ = self;
+        if (!client.ordered_grid or client.grid_sync_failed) return;
+        const grid = currentGrid(term);
+        ipc.appendMessage(gpa, &client.write_buf, .GridSync, std.mem.asBytes(&grid)) catch {
+            // A replica cannot skip a state transition and keep parsing.
+            client.grid_sync_failed = true;
+        };
+        client.has_pending_output = true;
+    }
+
+    fn resizeOrderedTerm(self: *Daemon, gpa: std.mem.Allocator, term: *ghostty_vt.Terminal, resize: ipc.Resize) !bool {
+        const previous = currentGrid(term);
+        if (resize.cols == 0 or resize.rows == 0) return false;
+        const cell_width = if (resize.xpixel != 0) resize.xpixel / resize.cols else previous.xpixel / previous.cols;
+        const cell_height = if (resize.ypixel != 0) resize.ypixel / resize.rows else previous.ypixel / previous.rows;
+        if (previous.cols == resize.cols and previous.rows == resize.rows and
+            term.width_px == @as(u32, resize.cols) * cell_width and
+            term.height_px == @as(u32, resize.rows) * cell_height) return false;
+        const saved = term.flags.shell_redraws_prompt;
+        term.flags.shell_redraws_prompt = .false;
+        defer term.flags.shell_redraws_prompt = saved;
+        try term.resize(gpa, .{
+            .cols = resize.cols,
+            .rows = resize.rows,
+            .cell_size_px = .{
+                .width = cell_width,
+                .height = cell_height,
+            },
+        });
+        for (self.clients.items) |client| {
+            if (client.is_terminal) self.appendGrid(gpa, client, term);
+        }
+        return true;
+    }
+
+    /// Resize the daemon state before notifying its PTY. GridSync occupies
+    /// the same client queue as Output, exactly at this state transition.
+    fn applyTerminalResize(self: *Daemon, gpa: std.mem.Allocator, pty_fd: i32, term: *ghostty_vt.Terminal, resize: ipc.Resize) !void {
+        if (resize.cols == 0 or resize.rows == 0) return;
+        _ = try self.resizeOrderedTerm(gpa, term, resize);
         var ws = resize.winsize();
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
-        try resizeTerm(gpa, term, resize.cols, resize.rows);
     }
 
     pub fn handleInit(
@@ -1433,7 +1505,8 @@ pub const Daemon = struct {
         // Cursor position stays consistent because it is serialized from the
         // same, already-resized terminal; the PTY is resized below, so the
         // shell's own SIGWINCH redraw still arrives after the snapshot.
-        try resizeTerm(gpa, term, resize.cols, resize.rows);
+        if (resize.cols == 0 or resize.rows == 0) return;
+        if (!try self.resizeOrderedTerm(gpa, term, resize)) self.appendGrid(gpa, client, term);
 
         // Detached startup can finish before the first terminal attaches. Restore
         // its retained output too; this snapshot does not replay device queries.
@@ -1455,7 +1528,11 @@ pub const Daemon = struct {
                         "failed to buffer terminal state for client err={s}",
                         .{@errorName(err)},
                     );
+                    client.grid_sync_failed = client.ordered_grid;
                 };
+                client.has_pending_output = true;
+            } else if (client.ordered_grid) {
+                client.grid_sync_failed = true;
                 client.has_pending_output = true;
             }
         }
@@ -1877,8 +1954,12 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            if (client.is_title_watcher) continue;
-            try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
+            if (client.is_title_watcher or client.grid_sync_failed) continue;
+            ipc.appendMessage(gpa, &client.write_buf, .Output, payload) catch |err| {
+                std.log.warn("failed to buffer injected output err={s}", .{@errorName(err)});
+                if (client.ordered_grid) client.grid_sync_failed = true;
+                continue;
+            };
             client.has_pending_output = true;
         }
         if (self.clients.items.len > 0) {

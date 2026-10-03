@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
         "ghostty-vt",
         dep.module("ghostty-vt"),
     );
+    // PNG decoding for kitty graphics reuses the Wuffs package Ghostty pins.
+    addWuffsImport(exe_mod, dep);
 
     // Run
     {
@@ -83,6 +85,7 @@ pub fn build(b: *std.Build) void {
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
         );
+        addWuffsImport(test_module, test_dep);
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
@@ -134,6 +137,7 @@ pub fn build(b: *std.Build) void {
                 .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
+                addWuffsImport(release_mod, release_dep);
             }
 
             // const is_local_macos = resolved.result.os.tag == .macos;
@@ -167,5 +171,13 @@ pub fn build(b: *std.Build) void {
             release_step.dependOn(&install_tar.step);
             release_step.dependOn(&install_sha.step);
         }
+    }
+}
+
+/// Reuse the exact Wuffs module Ghostty configured (including its normalized
+/// macOS deployment target), rather than compiling a second copy.
+fn addWuffsImport(module: *std.Build.Module, ghostty: *std.Build.Dependency) void {
+    if (ghostty.module("ghostty-vt").import_table.get("wuffs")) |wuffs| {
+        module.addImport("wuffs", wuffs);
     }
 }

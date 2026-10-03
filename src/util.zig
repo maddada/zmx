@@ -5,6 +5,7 @@ const socket = @import("socket.zig");
 const cross = @import("cross.zig");
 const label = @import("label.zig");
 const lib_posix = @import("posix.zig");
+const kitty_replay = @import("kitty_replay.zig");
 const testing = std.testing;
 
 pub const SessionEntry = struct {
@@ -753,25 +754,23 @@ pub fn isUserInput(payload: []const u8) bool {
 /// its own state back. See https://github.com/neurosnap/zmx/issues/222.
 /// CDXC:Zmx 2026-09-29 WHY:
 /// A client that attached while a full-screen TUI held the alternate screen (Codex's fullscreen view, its default since 0.157, or Claude Code) received only that grid, so its primary screen came up empty: the shell history from before the TUI was gone from that client, which showed a blank terminal once the TUI quit. The primary screen's history, grid and cursor are written first, the way ghostty's formatter documents replaying every screen; the active-screen replay that follows enters the alternate screen with `?1049h`, which saves exactly this cursor for the TUI's exit to restore. wmx cannot do the same: its vt100 grid exposes only the active screen.
-fn writePrimaryBehindAlternate(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
+fn writePrimaryBehindAlternate(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    term: *const ghostty_vt.Terminal,
+) !void {
     const primary = term.screens.get(.primary) orelse return;
+    var replay = try kitty_replay.Replay.init(alloc, primary);
+    defer replay.deinit();
+    try replay.transmit(writer);
     const pages = &primary.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
     if (!screen_top.eql(active_top)) {
-        if (active_top.up(1)) |sb_bottom_row| {
-            var sb_bottom = sb_bottom_row;
-            sb_bottom.x = @intCast(pages.cols - 1);
-            var scroll_fmt = ghostty_vt.formatter.ScreenFormatter.init(primary, .vt);
-            scroll_fmt.opts.unwrap = true;
-            scroll_fmt.content = .{
-                .selection = ghostty_vt.Selection.init(screen_top, sb_bottom, false),
-            };
-            try scroll_fmt.format(writer);
-        }
+        const advanced = try replay.history(writer);
         // Same two-phase contract as the active screen's replay below.
-        for (0..pages.rows) |_| try writer.writeAll("\r\n");
-        try writer.writeAll("\x1b[2J\x1b[H\x1b[0m");
+        for (0..pages.rows - advanced) |_| try writer.writeAll("\r\n");
+        try writer.writeAll(text_refresh_prefix);
     }
     const top_left = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return;
     const bottom_right = pages.pin(.{ .active = .{
@@ -783,12 +782,20 @@ fn writePrimaryBehindAlternate(writer: *std.Io.Writer, term: *const ghostty_vt.T
     grid_fmt.content = .{
         .selection = ghostty_vt.Selection.init(top_left, bottom_right, false),
     };
-    grid_fmt.extra = .none;
-    grid_fmt.extra.cursor = true;
     try grid_fmt.format(writer);
-    // Enter now, saving the cursor just placed, and home: the replay's own `?1049h`
-    // then finds the alternate screen active and leaves the cursor where its grid starts.
-    try writer.writeAll("\x1b[0m\x1b[?1049h\x1b[H");
+    // DECSC records origin mode as well as cursor coordinates. Restore the
+    // primary origin under full-screen margins before 1049 saves it. The
+    // active alternate screen's margins are restored after its own grid.
+    if (primary.saved_cursor) |saved| if (saved.origin) try writer.writeAll("\x1b[?6h");
+    if (primary.cursor.pending_wrap and primary.cursor.x != pages.cols - 1)
+        try writer.print("\x1b[?69h\x1b[1;{d}s", .{primary.cursor.x + 1});
+    try writeScreenCursor(writer, primary, 0, 0);
+    // Primary-screen images must land in the client's primary image storage.
+    try replay.placements(writer);
+    // Enter once, saving the primary cursor. Normalize only after that save
+    // so alternate grid output cannot inherit its origin or character set.
+    try writer.writeAll("\x1b[?1049h");
+    try writer.writeAll(text_refresh_prefix);
 }
 
 fn writePwd(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) void {
@@ -843,10 +850,14 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     term.modes.set(.wraparound, true);
     defer term.modes.set(.wraparound, had_wraparound);
     builder.writer.writeAll("\x1b[?7h") catch return null;
+    writePrintModes(&builder.writer, term) catch return null;
 
     // If state contains color override, restore it.
     writeColorOverrides(&builder.writer, term);
 
+    var replay = kitty_replay.Replay.init(alloc, term.screens.active) catch return null;
+    defer replay.deinit();
+    if (term.screens.active_key != .alternate) replay.transmit(&builder.writer) catch return null;
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
@@ -866,80 +877,29 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
 
     // Phase 1: scrollback only (if any exists)
     if (has_scrollback) {
-        if (active_top.up(1)) |sb_bottom_row| {
-            var sb_bottom = sb_bottom_row;
-            sb_bottom.x = @intCast(pages.cols - 1);
-
-            var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-            scroll_fmt.opts.unwrap = true;
-            scroll_fmt.content = .{
-                .selection = ghostty_vt.Selection.init(
-                    screen_top,
-                    sb_bottom,
-                    false,
-                ),
-            };
-            scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
-            scroll_fmt.format(&builder.writer) catch |err| {
-                std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
-            };
-        }
+        const advanced = replay.history(&builder.writer) catch return null;
 
         // handleInit resizes to the newly attached leader before serializing.
         // The formatter leaves its final row unterminated. Flush it and the
         // remaining viewport so the clear cannot erase retained history.
-        for (0..pages.rows) |_| {
+        for (0..pages.rows - advanced) |_| {
             builder.writer.writeAll("\r\n") catch return null;
         }
 
-        // Clear visible screen after scrollback. \x1b[2J clears only the visible
-        // rows (not the scrollback buffer). \x1b[H homes the cursor. \x1b[0m resets
-        // SGR style so phase 1 styles don't bleed into phase 2.
-        builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+        // Clear text only: ED2 would delete replayed straddling placements
+        // and unplaced assets. Reset SGR before ED0 to avoid background bleed.
+        builder.writer.writeAll(text_refresh_prefix) catch {};
     }
 
     if (term.screens.active_key == .alternate) {
-        writePrimaryBehindAlternate(&builder.writer, term) catch return null;
+        writePrimaryBehindAlternate(alloc, &builder.writer, term) catch return null;
+        replay.transmit(&builder.writer) catch return null;
     }
 
-    // Phase 2: visible screen with full extras (modes, cursor, keyboard, etc.)
-    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-    vis_fmt.opts.unwrap = true;
-
-    // Restrict content to the active viewport only
-    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
-    const active_br = pages.pin(.{
-        .active = .{
-            .x = @intCast(pages.cols - 1),
-            .y = @intCast(pages.rows - 1),
-        },
-    });
-
-    if (active_tl != null and active_br != null) {
-        vis_fmt.content = .{
-            .selection = ghostty_vt.Selection.init(
-                active_tl.?,
-                active_br.?,
-                false,
-            ),
-        };
-    }
-    // Fallback: if pins are somehow invalid, use null selection (all content)
-
-    vis_fmt.extra = .{
-        .palette = false,
-        .modes = true,
-        .scrolling_region = true,
-        .tabstops = false, // tabstop restoration moves cursor after CUP, corrupting position
-        .pwd = false, // emitted below without the sentinel the formatter includes
-        .keyboard = true,
-        .screen = .all,
-    };
-
-    vis_fmt.format(&builder.writer) catch |err| {
-        std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
-        return null;
-    };
+    // Phase 2: grid first, then application modes and cursor. Entering
+    // alternate mode again here would erase images just transmitted there.
+    writeViewport(&builder.writer, term) catch return null;
+    replay.placements(&builder.writer) catch return null;
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
@@ -963,6 +923,92 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     };
 }
 
+// ED0 preserves image storage; neutral margins, charset and hyperlink state
+// let the grid formatter address the full pane on an already attached client.
+const text_refresh_prefix = "\x1b[?6l\x1b[?69h\x1b[s\x1b[?69l\x1b[r\x1b[H\x1b[0m\x1b(B\x0f\x1b]8;;\x1b\\\x1b[J";
+
+// Grapheme clustering changes cell widths while printing, so it must precede
+// history and both screen grids. Emit either state for already attached clients.
+fn writePrintModes(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
+    try writer.writeAll(if (term.modes.get(.grapheme_cluster)) "\x1b[?2027h" else "\x1b[?2027l");
+}
+
+/// Paint the grid in neutral coordinates, then restore modes and margins
+/// before the region-relative cursor. The pinned formatter emits modes before
+/// content and absolute CUP afterward; that ordering cannot replay DECOM or
+/// safely refresh an already active alternate screen.
+fn writeViewport(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {
+    const screen = term.screens.active;
+    const pages = &screen.pages;
+    var grid = ghostty_vt.formatter.ScreenFormatter.init(screen, .vt);
+    grid.opts.unwrap = true;
+    grid.content = .{ .selection = ghostty_vt.Selection.init(
+        pages.getTopLeft(.active),
+        pages.getBottomRight(.active).?,
+        false,
+    ) };
+    try grid.format(writer);
+
+    // Only the mode bits are changed in this borrowed metadata view. The
+    // source terminal and its retained image/cursor state remain untouched.
+    var metadata = term.*;
+    inline for (.{ .alt_screen_legacy, .alt_screen, .alt_screen_save_cursor_clear_enter, .save_cursor }) |mode| metadata.modes.set(mode, false);
+    var extras = ghostty_vt.formatter.TerminalFormatter.init(&metadata, .vt);
+    extras.content = .none;
+    extras.extra = .{
+        .palette = false,
+        .modes = true,
+        .scrolling_region = true,
+        .tabstops = false,
+        .pwd = false,
+        .keyboard = true,
+        .screen = .none,
+    };
+    try extras.format(writer);
+
+    const region = term.scrolling_region;
+    const cursor = screen.cursor;
+    const origin = term.modes.get(.origin);
+    const outside = origin and (cursor.x < region.left or cursor.x > region.right or cursor.y < region.top or cursor.y > region.bottom);
+    const wrap_right = if (term.modes.get(.enable_left_and_right_margin) and cursor.x >= region.left and cursor.x <= region.right) region.right else pages.cols - 1;
+    if (outside or (cursor.pending_wrap and cursor.x != wrap_right)) {
+        // DECRC can restore an absolute cursor outside new margins while
+        // DECOM remains set. CUP cannot express that position. Save it under
+        // full margins, restore the real margins, then DECRC restores it.
+        try writer.writeAll("\x1b[?6l\x1b[?69h\x1b[s\x1b[?69l\x1b[r");
+        if (origin) try writer.writeAll("\x1b[?6h");
+        if (cursor.pending_wrap and cursor.x != pages.cols - 1)
+            try writer.print("\x1b[?69h\x1b[1;{d}s", .{cursor.x + 1});
+        try writeScreenCursor(writer, screen, 0, 0);
+        try writer.writeAll("\x1b7\x1b[?69h");
+        try writer.print("\x1b[{d};{d}s\x1b[{d};{d}r", .{ region.left + 1, region.right + 1, region.top + 1, region.bottom + 1 });
+        if (!term.modes.get(.enable_left_and_right_margin)) try writer.writeAll("\x1b[?69l");
+        try writer.writeAll("\x1b8");
+    } else try writeScreenCursor(writer, screen, if (origin) region.top else 0, if (origin) region.left else 0);
+}
+
+/// Cursor formatting with optional origin offsets. Unlike the pinned
+/// formatter, an edge space must be emitted to recreate pending wrap.
+fn writeScreenCursor(writer: *std.Io.Writer, screen: *const ghostty_vt.Screen, y_offset: u16, x_offset: u16) !void {
+    const cursor = &screen.cursor;
+    const start_x = if (cursor.pending_wrap and cursor.page_cell.wide == .spacer_tail) cursor.x - 1 else cursor.x;
+    try writer.print("\x1b[{d};{d}H", .{ cursor.y + 1 - y_offset, start_x + 1 - x_offset });
+    if (cursor.pending_wrap) {
+        var cell = ghostty_vt.formatter.PageFormatter.init(cursor.page_pin.node.page(), .vt);
+        cell.opts.trim = false;
+        cell.start_x = start_x;
+        cell.end_x = cursor.x;
+        cell.start_y = cursor.page_pin.y;
+        cell.end_y = cursor.page_pin.y;
+        try cell.format(writer);
+    }
+    var screen_extras = ghostty_vt.formatter.ScreenFormatter.init(screen, .vt);
+    screen_extras.content = .none;
+    screen_extras.extra = .all;
+    screen_extras.extra.cursor = false;
+    try screen_extras.format(writer);
+}
+
 /// Serialize only the active viewport, as a clear-and-repaint snapshot.
 ///
 /// CDXC:Zmx 2026-05-20-09:57: Ghostex can ask an already attached
@@ -974,9 +1020,9 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
-    // Same rationale as serializeTerminalState: synchronized output (DECSET
-    // 2026) is a handshake with the *current* client, so replaying it would
-    // make the repainted client defer rendering until its own timeout fires.
+    // Exclude the program's synchronized mode from formatter extras. The
+    // refresh supplies its own pair below, but leaves that pair open when
+    // the program is still updating the already-attached client.
     const had_synchronized_output = term.modes.get(.synchronized_output);
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
@@ -989,51 +1035,25 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
     term.modes.set(.wraparound, true);
     defer term.modes.set(.wraparound, had_wraparound);
     // CDXC:Zmx 2026-09-24 WHY:
-    // The refresh carries its own synchronized-output pair (DECSET 2026 set here, reset as the last bytes below), so a terminal that honors the mode paints the finished dump once instead of the intermediate states of a dump that arrives over several reads (a flash of older screens on every grid change). Unlike replaying the program's open handshake above, this pair closes inside the same message; terminals that ignore the private mode are unaffected.
+    // Batch the refresh under DECSET 2026 so clients paint one finished
+    // dump. Close it in this message unless the program already has an open
+    // update; that program's later reset retains ownership of the boundary.
     // SEE-ALSO: apps/desktop/src/terminal_element.rs `synchronized_output_since` (Ghostex defers painting while the mode is set); wmx sends its refresh snapshot with the same pair.
     builder.writer.writeAll("\x1b[?2026h") catch return null;
     builder.writer.writeAll("\x1b[?7h") catch return null;
+    writePrintModes(&builder.writer, term) catch return null;
 
-    builder.writer.writeAll("\x1b[2J\x1b[H\x1b[0m") catch {};
+    // ED0 clears the grid without deleting retained Kitty assets or pins.
+    // No graphics commands means mixed placements and internal IDs survive.
+    builder.writer.writeAll(text_refresh_prefix) catch {};
 
-    var vis_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-    vis_fmt.opts.unwrap = true;
-    const pages = &term.screens.active.pages;
-    const active_tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } });
-    const active_br = pages.pin(.{
-        .active = .{
-            .x = @intCast(pages.cols - 1),
-            .y = @intCast(pages.rows - 1),
-        },
-    });
-
-    if (active_tl != null and active_br != null) {
-        vis_fmt.content = .{
-            .selection = ghostty_vt.Selection.init(
-                active_tl.?,
-                active_br.?,
-                false,
-            ),
-        };
-    }
-    vis_fmt.extra = .{
-        .palette = false,
-        .modes = true,
-        .scrolling_region = true,
-        .tabstops = false,
-        .pwd = false, // emitted below without the sentinel the formatter includes
-        .keyboard = true,
-        .screen = .all,
-    };
-
-    vis_fmt.format(&builder.writer) catch |err| {
-        std.log.warn("failed to format visible terminal state err={s}", .{@errorName(err)});
-        return null;
-    };
+    writeViewport(&builder.writer, term) catch return null;
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
-    builder.writer.writeAll("\x1b[?2026l") catch return null;
+    // Preserve a program's open synchronized update; its later reset, not
+    // this repair snapshot, decides when the client may paint the frame.
+    if (!had_synchronized_output) builder.writer.writeAll("\x1b[?2026l") catch return null;
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;

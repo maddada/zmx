@@ -107,6 +107,10 @@ pub const Tag = enum(u8) {
     /// drop it via the `_` arm, so clients send `Info` right after it as an
     /// ordering barrier and treat an `Info` reply before `Capture` as "too old".
     Capture = 209,
+    /// Optional ordered grid replication. Client sends an empty capability
+    /// advertisement before Init; daemon sends Resize bytes at each grid
+    /// transition. Old daemons ignore it, and only advertisers get replies.
+    GridSync = 210,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
