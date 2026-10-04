@@ -311,6 +311,8 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
                             try stdout_buf.appendSlice(gpa, msg.payload);
                         }
                     },
+                    // CDXC:Zmx 2026-10-04 SEE-ALSO: Ghostex apps/desktop/src/terminal_model/viewer_grid.rs
+                    // consumes this nonce-scoped APC with four fixed-width hex fields and an ESC\ terminator.
                     .GridSync => {
                         if (grid_nonce) |nonce| {
                             if (msg.payload.len != @sizeOf(ipc.Resize)) return error.InvalidGridSync;
