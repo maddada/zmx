@@ -107,6 +107,14 @@ pub const Tag = enum(u8) {
     /// drop it via the `_` arm, so clients send `Info` right after it as an
     /// ordering barrier and treat an `Info` reply before `Capture` as "too old".
     Capture = 209,
+    /// CDXC:Zmx 2026-10-08 DECISION:
+    /// User: Chat View opens without a terminal ("Chat-only, no terminal"). Client -> daemon,
+    /// empty payload: this connection holds a chat claim (the 200-column resting grid, as a
+    /// `ZMX_CHAT` claim does) until it closes. gxserver keeps one such connection per
+    /// chat-displayed session. The connection gets no output and no reply; old daemons drop the
+    /// tag via the `_` arm, which leaves the grid as it was before the claim existed.
+    /// SEE-ALSO: .dependencies/wmx/src/display.rs claim_chat, server/src/session_chat_grid_claim.rs.
+    ChatClaim = 210,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -605,6 +613,7 @@ test "Ghostex fork Tag wire values are frozen" {
         .{ Tag.PromptEditorCapability, 204 }, .{ Tag.SendAcked, 205 },
         .{ Tag.SendAck, 206 },                .{ Tag.Visibility, 207 },
         .{ Tag.GridInfo, 208 },               .{ Tag.Capture, 209 },
+        .{ Tag.ChatClaim, 210 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

@@ -525,7 +525,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
-                                if (c.is_title_watcher) continue;
+                                if (c.is_title_watcher or c.is_chat_claimant) continue;
                                 ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -544,7 +544,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        if (client.is_title_watcher) continue;
+                        if (client.is_title_watcher or client.is_chat_claimant) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -651,6 +651,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .PromptEditorCapability => try daemon.handlePromptEditorCapability(gpa, client),
                         .Visibility => try daemon.handleVisibility(gpa, client, msg.payload),
                         .GridInfo => try daemon.handleGridInfo(gpa, client, &term),
+                        .ChatClaim => try daemon.handleChatClaim(gpa, client),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
                         // Daemon -> client tags. A client never sends these.
                         .Ack, .TaskComplete, .LabelData, .EnvData, .TitleObserved, .SendAck => {},
@@ -713,6 +714,10 @@ pub const Client = struct {
     /// user-visible client: they never receive Output/TaskComplete and are
     /// excluded from the `zmx list` client count.
     is_title_watcher: bool = false,
+    /// True for a `.ChatClaim` connection (gxserver holding the chat claim of a
+    /// chat shown without a terminal). Plumbing like a title watcher: no Output,
+    /// not counted by `zmx list`, never a leader.
+    is_chat_claimant: bool = false,
     /// Prompt-editor capability bits this client advertised on .Init.
     /// See `prompt_editor_capability_monaco` / `_code_server`.
     prompt_editor_capabilities: u8 = 0,
@@ -1129,7 +1134,11 @@ pub const Daemon = struct {
         var hidden: ?*Client = null;
         var chat_claim = false;
         for (self.clients.items) |client| {
-            if (!client.is_terminal) continue;
+            if (!client.is_terminal) {
+                // A `.ChatClaim` connection: a chat shown without any terminal.
+                chat_claim = chat_claim or client.is_chat_claimant;
+                continue;
+            }
             chat_claim = chat_claim or client.visibility == .chat;
             if (client.visibility != .visible) {
                 if (hidden == null or client.activity > hidden.?.activity) hidden = client;
@@ -1209,6 +1218,15 @@ pub const Daemon = struct {
         }
     }
 
+    /// `.ChatClaim`: this connection holds a chat claim until it closes (see
+    /// `ipc.Tag.ChatClaim`). A terminal client cannot turn into one.
+    pub fn handleChatClaim(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        if (client.is_terminal or client.is_chat_claimant) return;
+        client.is_chat_claimant = true;
+        std.log.info("chat claim held client_fd={d}", .{client.socket_fd});
+        try self.electLeader(gpa);
+    }
+
     /// `.GridInfo`: answer with one JSON object describing the grid, the
     /// leader, and every terminal client. Diagnostics for `zmx grid`.
     pub fn handleGridInfo(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) !void {
@@ -1218,7 +1236,7 @@ pub const Daemon = struct {
         const grid = currentGrid(term);
         var chat_claim = false;
         for (self.clients.items) |existing| {
-            chat_claim = chat_claim or (existing.is_terminal and existing.visibility == .chat);
+            chat_claim = chat_claim or (existing.is_terminal and existing.visibility == .chat) or existing.is_chat_claimant;
         }
         try w.print(
             "{{\"rows\":{d},\"cols\":{d},\"leader_fd\":{d},\"resting_rows\":{d},\"resting_cols\":{d},\"chat_claim\":{},\"clients\":[",
@@ -1226,11 +1244,20 @@ pub const Daemon = struct {
         );
         var first = true;
         for (self.clients.items) |existing| {
+            if (existing.is_chat_claimant) {
+                if (!first) try w.writeByte(',');
+                first = false;
+                try w.print(
+                    "{{\"fd\":{d},\"state\":\"chat\",\"activity\":0,\"last_size\":null,\"kind\":\"chat-claim\"}}",
+                    .{existing.socket_fd},
+                );
+                continue;
+            }
             if (!existing.is_terminal) continue;
             if (!first) try w.writeByte(',');
             first = false;
             try w.print(
-                "{{\"fd\":{d},\"state\":\"{s}\",\"activity\":{d},\"last_size\":",
+                "{{\"fd\":{d},\"state\":\"{s}\",\"activity\":{d},\"kind\":\"terminal\",\"last_size\":",
                 .{ existing.socket_fd, @tagName(existing.visibility), existing.activity },
             );
             if (existing.last_size) |resize| {
@@ -1704,7 +1731,7 @@ pub const Daemon = struct {
         // excluding this transient Info request.
         var visible_client_count: usize = 0;
         for (self.clients.items) |existing_client| {
-            if (!existing_client.is_title_watcher) visible_client_count += 1;
+            if (!existing_client.is_title_watcher and !existing_client.is_chat_claimant) visible_client_count += 1;
         }
         info.clients_len = if (visible_client_count > 0) visible_client_count - 1 else 0;
         info.pid = self.pid;
@@ -1877,7 +1904,7 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            if (client.is_title_watcher) continue;
+            if (client.is_title_watcher or client.is_chat_claimant) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }
