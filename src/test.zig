@@ -2,6 +2,7 @@ comptime {
     _ = @import("main.zig");
     _ = @import("util.zig");
     _ = @import("title_events.zig");
+    _ = @import("program_status.zig");
     _ = @import("socket.zig");
     _ = @import("ipc.zig");
     _ = @import("label.zig");

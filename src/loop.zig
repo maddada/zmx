@@ -7,6 +7,7 @@ const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const title_events = @import("title_events.zig");
+const program_status = @import("program_status.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -426,8 +427,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         // A pending title observation needs a bounded poll so the coalescer's
         // debounce / max-settle / heartbeat deadlines still fire on an
         // otherwise idle session. -1 when nothing is pending.
-        _ = try lib_posix.poll(poll_fds.items, daemon.titlePollTimeoutMs(io));
+        _ = try lib_posix.poll(poll_fds.items, daemon.pollTimeoutMs(io));
         try daemon.flushTitleIfDue(gpa, io);
+        daemon.flushProgramStatusIfDue(gpa, io);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -490,6 +492,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
+                    daemon.scanProgramStatus(gpa, io, buf[0..n]);
                     daemon.setPwd(&term);
                     if (term.getTitle()) |title| {
                         try daemon.observeTerminalTitle(gpa, io, title);
@@ -525,7 +528,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
-                                if (c.is_title_watcher or c.is_chat_claimant) continue;
+                                if (c.isPlumbing()) continue;
                                 ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
                                 c.has_pending_output = true;
                             }
@@ -541,10 +544,15 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // Broadcast data to all clients.
                     // Rewrite OSC 133;A to include redraw=0 so the outer terminal
                     // does not clear prompt lines on resize (issue #111).
-                    const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
-                    defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
+                    const redrawn = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
+                    defer if (redrawn.ptr != buf[0..n].ptr) gpa.free(redrawn);
+                    // The daemon answered any OSC 7501 feature query above, so
+                    // client terminals must not see (and answer) it again.
+                    const stripped = program_status.stripQueries(gpa, redrawn);
+                    defer if (stripped) |value| gpa.free(value);
+                    const broadcast_data = stripped orelse redrawn;
                     for (daemon.clients.items) |client| {
-                        if (client.is_title_watcher or client.is_chat_claimant) continue;
+                        if (client.isPlumbing()) continue;
                         ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
@@ -653,8 +661,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .GridInfo => try daemon.handleGridInfo(gpa, client, &term),
                         .ChatClaim => try daemon.handleChatClaim(gpa, client),
                         .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
+                        .ProgramStatusSubscribe => try daemon.handleProgramStatusSubscribe(gpa, io, client),
                         // Daemon -> client tags. A client never sends these.
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .TitleObserved, .SendAck => {},
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .TitleObserved, .SendAck, .ProgramStatus => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
@@ -718,6 +727,9 @@ pub const Client = struct {
     /// chat shown without a terminal). Plumbing like a title watcher: no Output,
     /// not counted by `zmx list`, never a leader.
     is_chat_claimant: bool = false,
+    /// True for a `.ProgramStatusSubscribe` connection (`zmx watch-title`).
+    /// Plumbing like a title watcher: no Output, not counted by `zmx list`.
+    is_status_watcher: bool = false,
     /// Prompt-editor capability bits this client advertised on .Init.
     /// See `prompt_editor_capability_monaco` / `_code_server`.
     prompt_editor_capabilities: u8 = 0,
@@ -738,6 +750,12 @@ pub const Client = struct {
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
+
+    /// Process plumbing rather than a user-visible client: never receives
+    /// Output or TaskComplete and is left out of client counts.
+    pub fn isPlumbing(self: *const Client) bool {
+        return self.is_title_watcher or self.is_chat_claimant or self.is_status_watcher;
+    }
 
     pub fn deinit(self: *Client, gpa: std.mem.Allocator) void {
         lib_posix.close(self.socket_fd);
@@ -802,6 +820,14 @@ pub const Daemon = struct {
     activity_clock: u64 = 0,
     shell: []const u8 = "/bin/sh",
     title_coalescer: title_events.Coalescer = .{},
+    /// OSC 7501 records of this terminal and the scanner that finds them in
+    /// pty output (see program_status.zig).
+    program_status: program_status.Store = .{},
+    program_status_scanner: program_status.Scanner = .{},
+    /// `program_status.generation` last sent to status watchers.
+    program_status_sent_generation: u64 = 0,
+    program_status_last_emit_ms: i64 = 0,
+    program_status_last_exit_check_ms: i64 = 0,
     /// Set by `run()` when this process actually created the session. Lets a
     /// caller tell "created" from "already existed", which `ensureSession`'s
     /// is-daemon-proc return value cannot express on its own.
@@ -828,6 +854,7 @@ pub const Daemon = struct {
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         self.title_coalescer.deinit(gpa);
+        self.program_status.deinit(gpa);
         // socket_path is NOT freed here: init()'s contract says the caller
         // owns everything passed into it, and in the daemon process it is a
         // PRE-fork allocation that must never be freed post-fork (see the
@@ -1669,6 +1696,132 @@ pub const Daemon = struct {
         }
     }
 
+    /// Shortest wait the poll loop may block for: title coalescing deadlines
+    /// and the program-status snapshot / exited-process checks.
+    pub fn pollTimeoutMs(self: *const Daemon, io: std.Io) i32 {
+        const title_timeout = self.titlePollTimeoutMs(io);
+        const status_timeout = self.programStatusPollTimeoutMs(nowMs(io));
+        if (title_timeout < 0) return status_timeout;
+        if (status_timeout < 0) return title_timeout;
+        return @min(title_timeout, status_timeout);
+    }
+
+    /// Minimum gap between two snapshots, so a program changing state as fast
+    /// as it can write costs gxserver at most ten snapshots a second.
+    const program_status_min_interval_ms: i64 = 100;
+    /// How often working/blocked records are checked against their process
+    /// group while nothing else wakes the loop.
+    const program_status_exit_check_ms: i64 = 1_000;
+
+    fn programStatusPollTimeoutMs(self: *const Daemon, now_ms: i64) i32 {
+        var due: ?i64 = null;
+        if (self.program_status.generation != self.program_status_sent_generation and self.hasStatusWatcher()) {
+            due = self.program_status_last_emit_ms + program_status_min_interval_ms;
+        }
+        if (self.program_status.hasTransient()) {
+            const check_due = self.program_status_last_exit_check_ms + program_status_exit_check_ms;
+            due = if (due) |value| @min(value, check_due) else check_due;
+        }
+        const value = due orelse return -1;
+        if (value <= now_ms) return 0;
+        return @intCast(@min(value - now_ms, std.math.maxInt(i32)));
+    }
+
+    fn hasStatusWatcher(self: *const Daemon) bool {
+        for (self.clients.items) |client| if (client.is_status_watcher) return true;
+        return false;
+    }
+
+    const ProgramStatusHandler = struct {
+        daemon: *Daemon,
+        gpa: std.mem.Allocator,
+        now_ms: i64,
+
+        pub fn onEvent(self: *ProgramStatusHandler, event: program_status.Scanner.Event) void {
+            const daemon = self.daemon;
+            switch (event) {
+                .program_status => |status| {
+                    const body = status.body orelse return;
+                    var parsed: program_status.Parsed = undefined;
+                    switch (program_status.parseBody(body, status.sequence_len, &parsed)) {
+                        .query => daemon.queuePtyInput(self.gpa, program_status.queryReply(status.terminator)),
+                        .report => daemon.program_status.apply(self.gpa, &parsed, self.now_ms, daemon.foregroundProcessGroup()) catch |err| {
+                            std.log.warn("program status report dropped err={s}", .{@errorName(err)});
+                        },
+                        .ignored => {},
+                    }
+                },
+                .prompt_start => daemon.program_status.onPromptStart(self.gpa),
+                .full_reset => daemon.program_status.onFullReset(self.gpa),
+            }
+        }
+    };
+
+    /// Feed pty output to the OSC 7501 scanner: store reports, answer the
+    /// feature query, and apply the prompt-start and full-reset lifetimes.
+    pub fn scanProgramStatus(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, bytes: []const u8) void {
+        var handler = ProgramStatusHandler{ .daemon = self, .gpa = gpa, .now_ms = nowMs(io) };
+        self.program_status_scanner.feed(bytes, &handler);
+    }
+
+    fn foregroundProcessGroup(self: *const Daemon) i32 {
+        if (self.pty_fd < 0) return 0;
+        var pgrp: lib_posix.pid_t = 0;
+        if (cross.c.ioctl(self.pty_fd, cross.c.TIOCGPGRP, &pgrp) == 0 and pgrp > 0) return @intCast(pgrp);
+        return 0;
+    }
+
+    fn processGroupAlive(_: void, pgid: i32) bool {
+        lib_posix.kill(-pgid, @enumFromInt(0)) catch |err| return err != error.ProcessNotFound;
+        return true;
+    }
+
+    /// Drop records of exited processes, then send a snapshot to status
+    /// watchers when the records changed and the minimum interval passed.
+    pub fn flushProgramStatusIfDue(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
+        const now_ms = nowMs(io);
+        if (self.program_status.hasTransient() and
+            now_ms - self.program_status_last_exit_check_ms >= program_status_exit_check_ms)
+        {
+            self.program_status_last_exit_check_ms = now_ms;
+            self.program_status.dropExited(gpa, {}, processGroupAlive);
+        }
+        if (self.program_status.generation == self.program_status_sent_generation) return;
+        if (now_ms - self.program_status_last_emit_ms < program_status_min_interval_ms) return;
+        var sent = false;
+        for (self.clients.items) |client| {
+            if (!client.is_status_watcher) continue;
+            self.sendProgramStatus(gpa, client) catch |err| {
+                std.log.warn("program status snapshot failed err={s}", .{@errorName(err)});
+                continue;
+            };
+            sent = true;
+        }
+        // With no watcher nothing is owed: a new subscriber gets a snapshot.
+        self.program_status_sent_generation = self.program_status.generation;
+        if (sent) self.program_status_last_emit_ms = now_ms;
+    }
+
+    fn sendProgramStatus(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        var builder: std.Io.Writer.Allocating = .init(gpa);
+        defer builder.deinit();
+        try self.program_status.writeJson(&builder.writer);
+        try ipc.appendMessage(gpa, &client.write_buf, .ProgramStatus, builder.written());
+        client.has_pending_output = true;
+    }
+
+    /// `.ProgramStatusSubscribe`: answer with the current snapshot at once (it
+    /// doubles as the "this daemon speaks OSC 7501" probe reply) and keep the
+    /// connection as a status watcher.
+    pub fn handleProgramStatusSubscribe(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client) !void {
+        client.is_status_watcher = true;
+        if (self.program_status.hasTransient()) {
+            self.program_status_last_exit_check_ms = nowMs(io);
+            self.program_status.dropExited(gpa, {}, processGroupAlive);
+        }
+        try self.sendProgramStatus(gpa, client);
+    }
+
     fn broadcastTitle(self: *Daemon, gpa: std.mem.Allocator, title: []const u8) !void {
         for (self.clients.items) |client| {
             if (!client.is_title_watcher) continue;
@@ -1731,7 +1884,7 @@ pub const Daemon = struct {
         // excluding this transient Info request.
         var visible_client_count: usize = 0;
         for (self.clients.items) |existing_client| {
-            if (!existing_client.is_title_watcher and !existing_client.is_chat_claimant) visible_client_count += 1;
+            if (!existing_client.isPlumbing()) visible_client_count += 1;
         }
         info.clients_len = if (visible_client_count > 0) visible_client_count - 1 else 0;
         info.pid = self.pid;
@@ -1904,7 +2057,7 @@ pub const Daemon = struct {
         self.setPwd(term);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            if (client.is_title_watcher or client.is_chat_claimant) continue;
+            if (client.isPlumbing()) continue;
             try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
             client.has_pending_output = true;
         }

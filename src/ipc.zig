@@ -115,6 +115,17 @@ pub const Tag = enum(u8) {
     /// tag via the `_` arm, which leaves the grid as it was before the claim existed.
     /// SEE-ALSO: .dependencies/wmx/src/display.rs claim_chat, server/src/session_chat_grid_claim.rs.
     ChatClaim = 210,
+    /// CDXC:ProgramStatus 2026-10-14 WHY:
+    /// Client -> daemon, empty payload: stream this session's OSC 7501 program-status records.
+    /// The daemon answers at once with one `ProgramStatus` snapshot and again whenever the records
+    /// change (at most every `program_status_min_interval_ms`). The connection is plumbing like a
+    /// title watcher: no Output, not counted by `zmx list`. Additive, so no WIRE_GENERATION bump:
+    /// an old daemon drops the tag through the `_` arm, and `zmx watch-title` sends `Info` right
+    /// after it as an ordering barrier, so an `Info` reply arriving first means "old daemon".
+    /// SEE-ALSO: src/program_status.zig, .dependencies/wmx/src/program_status.rs, server/src/program_status/.
+    ProgramStatusSubscribe = 211,
+    /// Daemon -> client: one JSON object `{"reported":bool,"records":[...]}` (no trailing newline).
+    ProgramStatus = 212,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -613,7 +624,8 @@ test "Ghostex fork Tag wire values are frozen" {
         .{ Tag.PromptEditorCapability, 204 }, .{ Tag.SendAcked, 205 },
         .{ Tag.SendAck, 206 },                .{ Tag.Visibility, 207 },
         .{ Tag.GridInfo, 208 },               .{ Tag.Capture, 209 },
-        .{ Tag.ChatClaim, 210 },
+        .{ Tag.ChatClaim, 210 },              .{ Tag.ProgramStatusSubscribe, 211 },
+        .{ Tag.ProgramStatus, 212 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
 }
 

@@ -612,7 +612,7 @@ fn help(io: std.Io) !void {
         \\  [p]rint <name> <text...>                 Inject text into session display
         \\  refresh-if-stale <name> <rows> <cols>    Repaint clients only when daemon grid differs
         \\  grid <name>                              Print the daemon grid and client leadership as JSON
-        \\  watch-title <name>                       Stream coalesced title observations as JSON lines
+        \\  watch-title <name>                       Stream coalesced title and program-status observations as JSON lines
         \\  prompt-editor-capability [name]          Print leader client prompt-editor support
         \\  [wr]ite <name> <file_path>               Write stdin to file_path through the session
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
@@ -2230,7 +2230,10 @@ fn printPromptEditorCapability(gpa: std.mem.Allocator, io: std.Io, socket_path: 
 /// `zmx watch-title <name>`
 ///
 /// Subscribes to the daemon's coalesced terminal-title observations and streams
-/// them as JSON lines ({"title":"..."}) until the session ends.
+/// them as JSON lines ({"title":"..."}) until the session ends. The same stream
+/// carries the session's OSC 7501 program-status records as
+/// {"programStatus":{"reported":bool,"records":[...]}} lines, or one
+/// {"programStatusSupported":false} line when the daemon is too old to keep them.
 /// `zmx grid <name>`
 ///
 /// Prints the daemon's grid, leader fd (-1 when the grid is resting), and
@@ -2254,6 +2257,13 @@ fn watchTitle(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void
     const client_sock = try socket.sessionConnect(socket_path);
     defer lib_posix.close(client_sock);
     try ipc.send(client_sock, .TitleSubscribe, "");
+    // Program status rides the same connection. The daemon answers the
+    // subscribe with a snapshot at once; `Info` right behind it is the
+    // ordering barrier, so an `Info` reply arriving first means the daemon
+    // predates OSC 7501 support (see `ipc.Tag.ProgramStatusSubscribe`).
+    try ipc.send(client_sock, .ProgramStatusSubscribe, "");
+    try ipc.send(client_sock, .Info, "");
+    var program_status_known = false;
 
     var read_buf = try ipc.SocketBuffer.init(gpa);
     defer read_buf.deinit();
@@ -2269,8 +2279,21 @@ fn watchTitle(gpa: std.mem.Allocator, io: std.Io, socket_path: []const u8) !void
         };
         if (n == 0) return;
         while (read_buf.next()) |msg| {
-            if (msg.header.tag != .TitleObserved) continue;
-            try title_events.writeTitleJsonLine(stdout, msg.payload);
+            switch (msg.header.tag) {
+                .TitleObserved => try title_events.writeTitleJsonLine(stdout, msg.payload),
+                .ProgramStatus => {
+                    program_status_known = true;
+                    try stdout.writeAll("{\"programStatus\":");
+                    try stdout.writeAll(msg.payload);
+                    try stdout.writeAll("}\n");
+                },
+                .Info => {
+                    if (program_status_known) continue;
+                    program_status_known = true;
+                    try stdout.writeAll("{\"programStatusSupported\":false}\n");
+                },
+                else => continue,
+            }
             try stdout.flush();
         }
     }
