@@ -115,7 +115,7 @@ pub const Tag = enum(u8) {
     /// tag via the `_` arm, which leaves the grid as it was before the claim existed.
     /// SEE-ALSO: .dependencies/wmx/src/display.rs claim_chat, server/src/session_chat_grid_claim.rs.
     ChatClaim = 210,
-    /// CDXC:ProgramStatus 2026-10-14 WHY:
+    /// CDXC:SessionStatus 2026-10-14 WHY:
     /// Client -> daemon, empty payload: stream this session's OSC 7501 program-status records.
     /// The daemon answers at once with one `ProgramStatus` snapshot and again whenever the records
     /// change (at most every `program_status_min_interval_ms`). The connection is plumbing like a

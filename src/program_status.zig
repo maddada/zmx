@@ -3,7 +3,7 @@
 //! id with the spec's lifetime rules. Spec:
 //! https://www.superlogical.com/rex/docs/build/program-status (revision 0.4).
 //!
-/// CDXC:ProgramStatus 2026-10-14 DECISION:
+/// CDXC:SessionStatus 2026-10-14 DECISION:
 /// User: "i want this implemented in the app and i want to have a setting to switch to using it instead of all the weird stuff we're doing to track when the agent is working or has attention status". The daemon is where OSC 7501 is parsed and its records are kept, because most sessions are not on screen (asleep, in the background, on the phone or the web) and only the daemon sees every byte. It also answers the `OSC 7501 ; ?` feature query itself, so a program under zmx learns the protocol is supported even with no client attached; Claude Code only reports after that answer.
 /// SEE-ALSO: .dependencies/wmx/src/program_status.rs (the Windows twin), server/src/program_status/ (gxserver's reader and the activity mapping), `ipc.Tag.ProgramStatusSubscribe`.
 const std = @import("std");
