@@ -262,9 +262,15 @@ fn isSelfOrDescendant(id: []const u8, ancestor: []const u8) bool {
 pub const Store = struct {
     records: std.ArrayList(Record) = .empty,
     seq: u64 = 0,
-    /// Set once any report was applied; never cleared. gxserver's "Auto"
-    /// setting trusts a session's reports from then on.
+    /// A program reported and is still running: set by every report, cleared
+    /// when the reporter's process group is gone (`dropExitedReporter`).
+    /// gxserver's "Auto" setting follows a session's reports only while this
+    /// is set, so after the reporting program exits the session goes back to
+    /// Ghostex's own detection until a program reports again. done and error
+    /// records stay (the spec keeps them past exit) but no longer carry it.
     ever_reported: bool = false,
+    /// Foreground process group when the last report arrived. 0 = unknown.
+    reporter_pgid: i32 = 0,
     /// Bumped on every change, so the daemon knows a snapshot is due.
     generation: u64 = 0,
     /// Input deliveries that submitted something (an Enter from an attached
@@ -305,6 +311,7 @@ pub const Store = struct {
     /// Apply one parsed report. `pgid` is the pty's foreground process group.
     pub fn apply(self: *Store, alloc: std.mem.Allocator, parsed: *const Parsed, now_ms: i64, pgid: i32) !void {
         self.ever_reported = true;
+        if (pgid > 0) self.reporter_pgid = pgid;
         if (parsed.clear) {
             var i: usize = self.records.items.len;
             var removed = false;
@@ -380,6 +387,25 @@ pub const Store = struct {
             }
         }
         if (removed) self.generation += 1;
+    }
+
+    /// The program that reported exited: the session no longer counts as
+    /// reporting. Its done and error records stay.
+    ///
+    /// CDXC:SessionStatus 2026-10-15 DECISION:
+    /// User: "fix that": under Auto a session must not stay on program status after the program that reported exits (quitting Claude and starting stable Codex in the same session left it stuck idle). The reporter is the foreground process group of the last report; once it is gone (the same check that drops working and blocked records) the session reports `reported:false` and goes back to Ghostex's detection until a program reports again.
+    /// SEE-ALSO: .dependencies/wmx/src/daemon.rs `flush_program_status` (the Windows twin).
+    pub fn dropExitedReporter(self: *Store, context: anytype, comptime alive: fn (@TypeOf(context), i32) bool) void {
+        if (!self.ever_reported or self.reporter_pgid <= 0) return;
+        if (alive(context, self.reporter_pgid)) return;
+        self.ever_reported = false;
+        self.reporter_pgid = 0;
+        self.generation += 1;
+    }
+
+    /// Whether anything waits on a process group to exit.
+    pub fn watchesProcesses(self: *const Store) bool {
+        return self.hasTransient() or (self.ever_reported and self.reporter_pgid > 0);
     }
 
     /// RIS (full reset) removes every record. DECSTR does not.
@@ -890,6 +916,23 @@ test "dropExited removes transient records of a gone process group" {
     store.dropExited(testing.allocator, {}, Ctx.alive);
     try testing.expectEqual(@as(usize, 1), store.records.items.len);
     try testing.expect(findRecord(&store, "x") != null);
+}
+
+test "the reporter exiting ends reporting but keeps done records" {
+    var store = Store{};
+    defer store.deinit(testing.allocator);
+    _ = try feedAll(&store, &.{ "\x1b]7501;state=working\x07", "\x1b]7501;state=done:id=x\x07" });
+    try testing.expect(store.ever_reported and store.watchesProcesses());
+    const Ctx = struct {
+        fn alive(_: void, _: i32) bool {
+            return false;
+        }
+    };
+    store.dropExited(testing.allocator, {}, Ctx.alive);
+    store.dropExitedReporter({}, Ctx.alive);
+    try testing.expect(!store.ever_reported);
+    try testing.expect(!store.watchesProcesses());
+    try testing.expectEqual(@as(usize, 1), store.records.items.len);
 }
 
 test "writeJson escapes text" {

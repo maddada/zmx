@@ -1722,7 +1722,7 @@ pub const Daemon = struct {
         if (self.program_status.generation != self.program_status_sent_generation and self.hasStatusWatcher()) {
             due = self.program_status_last_emit_ms + program_status_min_interval_ms;
         }
-        if (self.program_status.hasTransient()) {
+        if (self.program_status.watchesProcesses()) {
             const check_due = self.program_status_last_exit_check_ms + program_status_exit_check_ms;
             due = if (due) |value| @min(value, check_due) else check_due;
         }
@@ -1784,11 +1784,12 @@ pub const Daemon = struct {
     /// watchers when the records changed and the minimum interval passed.
     pub fn flushProgramStatusIfDue(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
         const now_ms = nowMs(io);
-        if (self.program_status.hasTransient() and
+        if (self.program_status.watchesProcesses() and
             now_ms - self.program_status_last_exit_check_ms >= program_status_exit_check_ms)
         {
             self.program_status_last_exit_check_ms = now_ms;
             self.program_status.dropExited(gpa, {}, processGroupAlive);
+            self.program_status.dropExitedReporter({}, processGroupAlive);
         }
         if (self.program_status.generation == self.program_status_sent_generation) return;
         if (now_ms - self.program_status_last_emit_ms < program_status_min_interval_ms) return;
@@ -1819,9 +1820,10 @@ pub const Daemon = struct {
     /// connection as a status watcher.
     pub fn handleProgramStatusSubscribe(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client) !void {
         client.is_status_watcher = true;
-        if (self.program_status.hasTransient()) {
+        if (self.program_status.watchesProcesses()) {
             self.program_status_last_exit_check_ms = nowMs(io);
             self.program_status.dropExited(gpa, {}, processGroupAlive);
+            self.program_status.dropExitedReporter({}, processGroupAlive);
         }
         try self.sendProgramStatus(gpa, client);
     }
