@@ -267,6 +267,12 @@ pub const Store = struct {
     ever_reported: bool = false,
     /// Bumped on every change, so the daemon knows a snapshot is due.
     generation: u64 = 0,
+    /// Input deliveries that submitted something (an Enter from an attached
+    /// client, `zmx send`, `zmx run`). Rides along in every snapshot; a change
+    /// alone sends none. gxserver counts an agent's working → idle as a
+    /// finished turn only when the working began after such input, so a
+    /// program's own start-up (idle, working while it loads, idle) never is.
+    submits: u64 = 0,
 
     pub fn deinit(self: *Store, alloc: std.mem.Allocator) void {
         for (self.records.items) |*record| record.deinit(alloc);
@@ -284,6 +290,11 @@ pub const Store = struct {
     fn removeAt(self: *Store, alloc: std.mem.Allocator, index: usize) void {
         var record = self.records.orderedRemove(index);
         record.deinit(alloc);
+    }
+
+    /// Count `bytes` (input bound for the program) when it submits something.
+    pub fn noteInput(self: *Store, bytes: []const u8) void {
+        if (isSubmit(bytes)) self.submits += 1;
     }
 
     pub fn hasTransient(self: *const Store) bool {
@@ -382,7 +393,7 @@ pub const Store = struct {
     /// One JSON object: `{"reported":bool,"records":[...]}`, records in
     /// report order. Text values are already free of control characters.
     pub fn writeJson(self: *const Store, writer: *std.Io.Writer) !void {
-        try writer.print("{{\"reported\":{},\"records\":[", .{self.ever_reported});
+        try writer.print("{{\"reported\":{},\"submits\":{d},\"records\":[", .{ self.ever_reported, self.submits });
         for (self.records.items, 0..) |record, i| {
             if (i > 0) try writer.writeByte(',');
             try writer.writeAll("{\"id\":");
@@ -407,6 +418,15 @@ pub const Store = struct {
         try writer.writeAll("]}");
     }
 };
+
+/// Enter as a terminal sends it: CR or LF (legacy and most kitty keyboard
+/// modes), or the kitty "report all keys" forms of Enter and keypad Enter.
+pub fn isSubmit(bytes: []const u8) bool {
+    if (std.mem.indexOfAny(u8, bytes, "\r\n") != null) return true;
+    return std.mem.indexOf(u8, bytes, "\x1b[13u") != null or
+        std.mem.indexOf(u8, bytes, "\x1b[13;") != null or
+        std.mem.indexOf(u8, bytes, "\x1b[57414") != null;
+}
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeByte('"');
@@ -881,9 +901,22 @@ test "writeJson escapes text" {
     defer out.deinit();
     try store.writeJson(&out.writer);
     try testing.expectEqualStrings(
-        "{\"reported\":true,\"records\":[{\"id\":\"\",\"state\":\"blocked\",\"kind\":\"question\",\"app\":\"claude-code\",\"msg\":\"say \\\"hi\\\" \\\\\",\"seq\":1,\"updatedAtMs\":1000}]}",
+        "{\"reported\":true,\"submits\":0,\"records\":[{\"id\":\"\",\"state\":\"blocked\",\"kind\":\"question\",\"app\":\"claude-code\",\"msg\":\"say \\\"hi\\\" \\\\\",\"seq\":1,\"updatedAtMs\":1000}]}",
         out.written(),
     );
+}
+
+test "only an Enter counts as a submit" {
+    var store = Store{};
+    defer store.deinit(testing.allocator);
+    store.noteInput("ls");
+    store.noteInput("\x1b[I");
+    store.noteInput("\x1b[A");
+    try testing.expectEqual(@as(u64, 0), store.submits);
+    store.noteInput("ls\r");
+    store.noteInput("\x1b[13u");
+    store.noteInput("\x1b[13;1u");
+    try testing.expectEqual(@as(u64, 3), store.submits);
 }
 
 test "stripQueries removes only complete queries" {

@@ -1361,6 +1361,7 @@ pub const Daemon = struct {
 
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
+            self.program_status.noteInput(payload);
             self.queuePtyInput(gpa, payload);
             return;
         }
@@ -1368,12 +1369,14 @@ pub const Daemon = struct {
         // check if leader needs to be updated by detecting any user input
         if (is_user_input) {
             try self.setLeader(gpa, client);
+            self.program_status.noteInput(payload);
             self.queuePtyInput(gpa, payload);
         }
     }
 
     /// Queue input from `zmx send` without changing interactive client leadership.
     pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) void {
+        self.program_status.noteInput(payload);
         self.queuePtyInput(gpa, payload);
     }
 
@@ -1394,6 +1397,7 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         const status = self.queuePtyInputChecked(gpa, payload);
+        if (status == .queued) self.program_status.noteInput(payload);
         try ipc.appendMessage(
             gpa,
             &client.write_buf,
@@ -1994,6 +1998,7 @@ pub const Daemon = struct {
         const heredoc_marker = try std.fmt.bufPrint(&here_buf, "\r\necho {s}$?\r", .{marker});
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
+        self.program_status.noteInput("\r");
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
             self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
         } else {
