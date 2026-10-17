@@ -1755,7 +1755,7 @@ pub const Daemon = struct {
                         .ignored => {},
                     }
                 },
-                .prompt_start => daemon.program_status.onPromptStart(self.gpa),
+                .prompt_start => daemon.program_status.onPromptStart(self.gpa, daemon.foregroundProcessGroup(), daemon.pid),
                 .full_reset => daemon.program_status.onFullReset(self.gpa),
             }
         }

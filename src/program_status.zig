@@ -358,7 +358,14 @@ pub const Store = struct {
     /// OSC 133;A (a new shell prompt): working and blocked records end, and so
     /// do idle ones (the spec allows it; an idle record of a program that
     /// already returned to the prompt describes nothing). done and error stay.
-    pub fn onPromptStart(self: *Store, alloc: std.mem.Allocator) void {
+    /// `foreground` is the pty's foreground process group when the mark was
+    /// read and `shell_pgid` the session shell's (0 when unknown).
+    ///
+    /// CDXC:SessionStatus 2026-10-17 WHY:
+    /// The spec has the shell emit OSC 133, so a mark written while the program that reported still owns the terminal (its process group is in front, not the shell's) is that program's own output and ends nothing. Pi 1.3 frames every message it draws in OSC 133 A/B/C zones, so treating its marks as a prompt dropped its working record a moment into every turn; Ghostex then read the session idle mid-turn, the chat queue sent into the running turn and the send recovery restarted Pi, losing the turn (agent flow tests, 2026-10-17).
+    /// SEE-ALSO: .dependencies/wmx/src/program_status.rs `on_prompt_start` (the Windows twin).
+    pub fn onPromptStart(self: *Store, alloc: std.mem.Allocator, foreground: i32, shell_pgid: i32) void {
+        if (foreground > 0 and foreground != shell_pgid and self.ever_reported and self.reporter_pgid == foreground) return;
         var i: usize = self.records.items.len;
         var removed = false;
         while (i > 0) {
@@ -700,7 +707,7 @@ const Collector = struct {
             },
             .prompt_start => {
                 self.prompts += 1;
-                self.store.onPromptStart(self.alloc);
+                self.store.onPromptStart(self.alloc, 0, 0);
             },
             .full_reset => {
                 self.resets += 1;
