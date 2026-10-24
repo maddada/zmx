@@ -1,5 +1,4 @@
 const std = @import("std");
-const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
@@ -14,6 +13,8 @@ const signal = @import("signal.zig");
 const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
+const terminal = @import("terminal.zig");
+const ghostty_vt = terminal.ghostty_vt;
 
 /// Prompt-editor capability bits advertised by an attaching client on .Init.
 pub const prompt_editor_capability_monaco: u8 = 1;
@@ -236,7 +237,12 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-            try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+            try ipc.appendMessage(
+                gpa,
+                &sock_write_buf,
+                .Resize,
+                std.mem.asBytes(&next_size),
+            );
         }
 
         // Handle stdin -> socket (Input)
@@ -292,7 +298,12 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
                         // daemon is asking for the client's window size usually in response
                         // to this client being set as leader.
                         const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
-                        try ipc.appendSizeMessage(gpa, &sock_write_buf, .Resize, next_size);
+                        try ipc.appendMessage(
+                            gpa,
+                            &sock_write_buf,
+                            .Resize,
+                            std.mem.asBytes(&next_size),
+                        );
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
@@ -663,12 +674,16 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .TitleSubscribe => try daemon.handleTitleSubscribe(gpa, io, client, &term),
                         .ProgramStatusSubscribe => try daemon.handleProgramStatusSubscribe(gpa, io, client),
                         // Daemon -> client tags. A client never sends these.
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .TitleObserved, .SendAck, .ProgramStatus => {},
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .TitleObserved, .SendAck, .ProgramStatus, .Unsupported => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        _ => std.log.warn(
-                            "ignoring unknown IPC tag={d}",
-                            .{@intFromEnum(msg.header.tag)},
-                        ),
+                        _ => {
+                            std.log.warn(
+                                "ignoring unknown IPC tag={d}",
+                                .{@intFromEnum(msg.header.tag)},
+                            );
+                            ipc.appendMessage(gpa, &client.write_buf, .Unsupported, "") catch {};
+                            client.has_pending_output = true;
+                        },
                     }
                 }
             }
@@ -684,6 +699,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 };
 
                 if (n > 0) {
+                    client.sent_output = true;
                     client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
                 }
 
@@ -693,6 +709,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             }
 
             if (revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0) {
+                // A client that writes and exits (`zmx send`, `zmx run -d`) is
+                // reported HUP with part of its message still unread: a pass
+                // reads at most 4 KiB. Closing now drops the rest. Leave it to
+                // the next pass, which reads on until EOF closes the client.
+                if (revents & lib_posix.POLL.IN != 0 and
+                    revents & (lib_posix.POLL.ERR | lib_posix.POLL.NVAL) == 0) continue;
                 const last = daemon.closeClient(gpa, client, i, false);
                 if (last) break :daemon_loop;
             }
@@ -716,6 +738,8 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
+    /// True once any byte of `write_buf` reached the socket (see `handleInit`).
+    sent_output: bool = false,
     /// True once the client sent .Init, i.e. it is a real attached terminal
     /// that can render an Output repaint.
     is_terminal: bool = false,
@@ -805,7 +829,6 @@ pub const Daemon = struct {
     cwd_buf: [std.fs.max_path_bytes]u8 = undefined,
     cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     has_pty_output: bool = false,
-    has_had_client: bool = false,
     created_at: u64, // unix timestamp (ns)
     is_task_mode: bool = false, // flag for when session is run as a task
     task_id: [4]u8 = undefined,
@@ -832,6 +855,7 @@ pub const Daemon = struct {
     /// caller tell "created" from "already existed", which `ensureSession`'s
     /// is-daemon-proc return value cannot express on its own.
     created_session: bool = false,
+    quiet: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -981,7 +1005,7 @@ pub const Daemon = struct {
         std.log.info("creating session=<redacted>", .{});
         self.created_session = true;
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
-        const log_fd = log.log_system.file.?.handle;
+        const log_fd = if (log.log_system.file) |f| f.handle else -1;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
         const cmd = try daemonize.createCmdZ(self.shell, self.is_task_mode, self.command);
@@ -1010,10 +1034,12 @@ pub const Daemon = struct {
             switch (err) {
                 error.IsClientProc => {
                     // send a msg to the client that the session was created.
-                    var w_buf: [2048]u8 = undefined;
-                    var w = std.Io.File.stdout().writer(io, &w_buf);
-                    try w.interface.print("session \"{s}\" created\n", .{sesh_name});
-                    try w.interface.flush();
+                    if (!self.quiet) {
+                        var w_buf: [2048]u8 = undefined;
+                        var w = std.Io.File.stdout().writer(io, &w_buf);
+                        try w.interface.print("session \"{s}\" created\n", .{sesh_name});
+                        try w.interface.flush();
+                    }
                     lib_posix.close(server_sock_fd);
                     return false;
                 },
@@ -1466,6 +1492,13 @@ pub const Daemon = struct {
         payload: []const u8,
     ) !void {
         if (payload.len < @sizeOf(ipc.Resize)) return;
+
+        // CDXC:Zmx 2026-10-24 WHY:
+        // Pty output broadcast between accept() and this Init is raw output the snapshot below already holds, including device queries the session has answered; a terminal that received it would answer them again. Drop it, but only while nothing has reached the socket yet: frames are written without regard to their boundaries, so a partly written buffer starts mid-frame and dropping its tail would break the client's framing.
+        if (!client.is_terminal and !client.sent_output) {
+            client.write_buf.clearRetainingCapacity();
+            client.has_pending_output = false;
+        }
         client.is_terminal = true;
         // CDXC:PromptEditor 2026-06-06-16:40: zmx attach clients advertise
         // prompt-editor support explicitly; an omitted capability byte means
@@ -1521,19 +1554,16 @@ pub const Daemon = struct {
         var ws = resize.winsize();
         _ = cross.c.ioctl(pty_fd, cross.c.TIOCSWINSZ, &ws);
 
-        // On re-attach, deliver SIGWINCH to the foreground process group so
+        // On attach, deliver SIGWINCH to the foreground process group so
         // incremental renderers (Ink, Claude Code, etc.) know to repaint.
         // If the size changed, TIOCSWINSZ above already sent SIGWINCH; if the size
         // was unchanged, the kernel suppressed it, so signal the pgrp explicitly.
-        if (self.has_pty_output and self.has_had_client) {
+        if (self.has_pty_output) {
             var pgrp: lib_posix.pid_t = 0;
             if (cross.c.ioctl(pty_fd, cross.c.TIOCGPGRP, &pgrp) == 0 and pgrp > 0) {
                 lib_posix.kill(-pgrp, .WINCH) catch {};
             }
         }
-
-        // Subsequent attachments also request a foreground-process repaint.
-        self.has_had_client = true;
 
         std.log.debug("init resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1883,6 +1913,7 @@ pub const Daemon = struct {
         // zeroes() so asBytes() doesn't ship struct padding + unused cmd/cwd
         // tail bytes (daemon stack contents) to clients.
         var info = std.mem.zeroes(ipc.Info);
+        info.protocol_version = ipc.PROTOCOL_VERSION;
         // CDXC:SessionStatus 2026-06-01-10:17:
         // gxserver keeps a long-lived title watcher attached to each observed
         // zmx session. That watcher is process plumbing, not a user-visible
@@ -2010,7 +2041,6 @@ pub const Daemon = struct {
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
-        self.has_had_client = true;
         std.log.debug("run command len={d}", .{payload.len});
     }
 
@@ -2118,7 +2148,6 @@ pub const Daemon = struct {
 
         try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
         client.has_pending_output = true;
-        self.has_had_client = true;
         std.log.debug(
             "write command len={d} file_path=<redacted>",
             .{file_content.len},
