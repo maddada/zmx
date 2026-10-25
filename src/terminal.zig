@@ -144,7 +144,7 @@ fn writeDynamicColor(
 ) void {
     const c = dynamic.override orelse return;
     writer.print("\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
-        @intFromEnum(kind), c.r, c.g, c.b,
+        @backingInt(kind), c.r, c.g, c.b,
     }) catch |err| {
         std.log.warn("failed to format dynamic color err={s}", .{@errorName(err)});
     };
@@ -155,6 +155,18 @@ fn writeColorOverrides(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal)
     writeDynamicColor(writer, .foreground, colors.foreground);
     writeDynamicColor(writer, .background, colors.background);
     writeDynamicColor(writer, .cursor, colors.cursor);
+}
+
+/// The VT formatter does not emit the cursor shape (DECSCUSR).
+fn writeCursorStyle(writer: *std.Io.Writer, term: *ghostty_vt.Terminal) !void {
+    if (term.cursor.is_default) return writer.writeAll("\x1b[0 q");
+    const blink = term.modes.get(.cursor_blinking);
+    const style: u8 = switch (term.screens.active.cursor.cursor_style) {
+        .block, .block_hollow => if (blink) 1 else 2,
+        .underline => if (blink) 3 else 4,
+        .bar => if (blink) 5 else 6,
+    };
+    try writer.print("\x1b[{d} q", .{style});
 }
 
 /// CDXC:Zmx 2026-09-24 WHY:
@@ -289,6 +301,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             std.log.warn("failed to format title err={s}", .{@errorName(err)});
         };
     }
+
+    writeCursorStyle(&builder.writer, term) catch |err| {
+        std.log.warn("failed to restore cursor style err={s}", .{@errorName(err)});
+    };
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
