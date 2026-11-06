@@ -7,6 +7,7 @@ pub const serializeTerminalState = if (has_daemon) terminal.serializeTerminalSta
 pub const serializeTerminal = if (has_daemon) terminal.serializeTerminal else struct {};
 pub const serializeTerminalRange = if (has_daemon) terminal.serializeTerminalRange else struct {};
 pub const serializeVisibleTerminalState = if (has_daemon) terminal.serializeVisibleTerminalState else struct {};
+pub const serializeResyncState = if (has_daemon) terminal.serializeResyncState else struct {};
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
 const cross = @import("cross");

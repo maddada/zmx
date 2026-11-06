@@ -90,6 +90,9 @@ fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
 /// request through the attached terminal because that path is already connected
 /// to the correct zmx client. zmx must consume that exact sequence locally and
 /// convert it to Refresh IPC so the shell/PTY never receives the control bytes.
+/// Output the attach client holds for its outer terminal before it stops reading the daemon.
+const CLIENT_STDOUT_BACKLOG_MAX: usize = 256 * 1024;
+
 fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
     var remaining = input;
     while (std.mem.indexOf(u8, remaining, ghostex_osc_prefix)) |index| {
@@ -212,8 +215,13 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
             .revents = 0,
         });
 
-        // Poll socket for read, and also for write if we have pending data
-        var sock_events: i16 = lib_posix.POLL.IN;
+        // Poll socket for read, and also for write if we have pending data.
+        // CDXC:Zmx 2026-11-06 WHY:
+        // Stop reading Output while the outer terminal is this far behind (a remote link, a stalled
+        // viewer). The backlog then waits in the daemon, which skips a lagging terminal client ahead
+        // to a snapshot (`Daemon.CLIENT_BACKLOG_MAX`) instead of growing this buffer without bound
+        // and streaming every byte of an agent's redraw over the link (GitHub #429).
+        var sock_events: i16 = if (stdout_buf.items.len < CLIENT_STDOUT_BACKLOG_MAX) lib_posix.POLL.IN else 0;
         if (sock_write_buf.items.len > 0) {
             sock_events |= lib_posix.POLL.OUT;
         }
@@ -565,14 +573,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = stripped orelse redrawn;
                     for (daemon.clients.items) |client| {
                         if (client.isPlumbing()) continue;
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
+                        client.queueLiveOutput(gpa, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
                             );
-                            continue;
                         };
-                        client.has_pending_output = true;
                     }
                 }
             }
@@ -702,6 +708,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 if (n > 0) {
                     client.sent_output = true;
                     client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+                    client.resync_bytes -|= n;
+                }
+
+                // Everything queued before the skip has reached the client: send it
+                // the current screen and history in place of the output it missed.
+                if (client.write_buf.items.len == 0 and client.resync_pending) {
+                    daemon.appendResync(gpa, client, &term);
                 }
 
                 if (client.write_buf.items.len == 0) {
@@ -775,6 +788,42 @@ pub const Client = struct {
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
     env_str: ?[]u8 = null,
+    /// CDXC:Zmx 2026-11-06: this terminal client fell more than `Daemon.CLIENT_BACKLOG_MAX`
+    /// behind, so live output is no longer queued for it; once `write_buf` drains it gets one
+    /// snapshot of the screen and its history instead (`Daemon.appendResync`).
+    resync_pending: bool = false,
+    /// Bytes of the queued resync snapshot still in `write_buf`. They are not backlog: counting
+    /// them would skip the client again the moment its snapshot was queued.
+    resync_bytes: usize = 0,
+    /// Live output dropped since this client started skipping, for the resync log line.
+    skipped_bytes: usize = 0,
+
+    /// Live output queued for this client and not yet written to its socket.
+    pub fn outputBacklog(self: *const Client) usize {
+        return self.write_buf.items.len -| self.resync_bytes;
+    }
+
+    /// Queue PTY output, unless this terminal client is too far behind to take it: then it skips
+    /// ahead and waits for its resync snapshot (`resync_pending`).
+    pub fn queueLiveOutput(self: *Client, gpa: std.mem.Allocator, data: []const u8) !void {
+        if (self.is_terminal) {
+            if (self.resync_pending) {
+                self.skipped_bytes += data.len;
+                return;
+            }
+            if (self.outputBacklog() + data.len > Daemon.CLIENT_BACKLOG_MAX) {
+                std.log.info(
+                    "client far behind, skipping ahead client_fd={d} backlog={d}",
+                    .{ self.socket_fd, self.outputBacklog() },
+                );
+                self.resync_pending = true;
+                self.skipped_bytes = data.len;
+                return;
+            }
+        }
+        try ipc.appendMessage(gpa, &self.write_buf, .Output, data);
+        self.has_pending_output = true;
+    }
 
     /// Process plumbing rather than a user-visible client: never receives
     /// Output or TaskComplete and is left out of client counts.
@@ -1337,6 +1386,39 @@ pub const Daemon = struct {
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
 
+    /// CDXC:Zmx 2026-11-06 WHY:
+    /// How far a terminal client may fall behind the PTY before it skips ahead. An agent built on
+    /// pi-tui (ZCode, Pi) reprints its whole conversation on every width change; over a remote
+    /// link every byte of that streamed for minutes after a Chat to Terminal switch (GitHub #429).
+    /// A client this far behind stops receiving live output and, once it has drained what was
+    /// queued, gets the current screen and history instead, so a flood ends a snapshot's transfer
+    /// after the agent stops writing. A local viewer drains far faster than any agent writes and
+    /// never reaches it. The attach client stops reading past its own smaller cap
+    /// (`CLIENT_STDOUT_BACKLOG_MAX`), which is what keeps a slow link's backlog here.
+    pub const CLIENT_BACKLOG_MAX: usize = 1024 * 1024;
+
+    /// Queue the resync snapshot for a client that skipped live output (`Client.resync_pending`).
+    pub fn appendResync(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) void {
+        client.resync_pending = false;
+        const skipped = client.skipped_bytes;
+        client.skipped_bytes = 0;
+        if (!self.has_pty_output) return;
+        const snapshot = util.serializeResyncState(gpa, term) orelse return;
+        defer gpa.free(snapshot);
+        const restore_data = util.rewritePromptRedraw(gpa, snapshot) orelse snapshot;
+        defer if (restore_data.ptr != snapshot.ptr) gpa.free(restore_data);
+        ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
+            std.log.warn("failed to buffer resync snapshot err={s}", .{@errorName(err)});
+            return;
+        };
+        client.resync_bytes = client.write_buf.items.len;
+        client.has_pending_output = true;
+        std.log.info(
+            "client resynced client_fd={d} skipped_bytes={d} snapshot_bytes={d}",
+            .{ client.socket_fd, skipped, restore_data.len },
+        );
+    }
+
     /// Queue bytes for the PTY's stdin. Flushed by daemonLoop on POLLOUT.
     /// Drops the payload if the buffer is over cap -- same failure mode as
     /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
@@ -1598,6 +1680,8 @@ pub const Daemon = struct {
 
     fn appendVisibleRefresh(self: *Daemon, gpa: std.mem.Allocator, client: *Client, term: *ghostty_vt.Terminal) void {
         if (!self.has_pty_output) return;
+        // A skipping client is about to get a full snapshot; a repaint now would only add backlog.
+        if (client.resync_pending) return;
         if (util.serializeVisibleTerminalState(gpa, term)) |term_output| {
             std.log.debug("serialize visible terminal state", .{});
             const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
@@ -2298,6 +2382,103 @@ test "hasTerminalClient follows attach, detach and detach-all" {
     daemon.handleDetachAll(alloc);
     try std.testing.expect(!daemon.hasTerminalClient());
     try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+}
+
+test "a terminal client far behind skips live output and resyncs once drained" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.pty_write_buf.deinit(alloc);
+    const fds = try lib_posix.pipe2(.{});
+    const viewer = try testClient(alloc, fds[0], true);
+    defer {
+        viewer.deinit(alloc);
+        alloc.destroy(viewer);
+    }
+    const tail = try testClient(alloc, fds[1], false);
+    defer {
+        tail.deinit(alloc);
+        alloc.destroy(tail);
+    }
+
+    const chunk: [64 * 1024]u8 = @splat('x');
+    var sent: usize = 0;
+    while (!viewer.resync_pending) : (sent += chunk.len) {
+        try viewer.queueLiveOutput(alloc, &chunk);
+        try tail.queueLiveOutput(alloc, &chunk);
+        try std.testing.expect(sent < 2 * Daemon.CLIENT_BACKLOG_MAX);
+    }
+    const queued = viewer.write_buf.items.len;
+    try std.testing.expect(queued <= Daemon.CLIENT_BACKLOG_MAX + 32 * @sizeOf(ipc.Header));
+
+    // Output while skipping is counted, not queued; a non-terminal client keeps every byte.
+    for (0..8) |_| {
+        try viewer.queueLiveOutput(alloc, &chunk);
+        try tail.queueLiveOutput(alloc, &chunk);
+    }
+    try std.testing.expectEqual(queued, viewer.write_buf.items.len);
+    try std.testing.expectEqual(9 * chunk.len, viewer.skipped_bytes);
+    try std.testing.expect(!tail.resync_pending);
+    try std.testing.expect(tail.write_buf.items.len > Daemon.CLIENT_BACKLOG_MAX + 8 * chunk.len);
+
+    // Drained: the client gets one snapshot of the daemon's terminal instead.
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 40, .rows = 5 }, &cfg);
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    for (0..20) |i| {
+        var line: [32]u8 = undefined;
+        stream.nextSlice(try std.fmt.bufPrint(&line, "line {d}\r\n", .{i}));
+    }
+    daemon.has_pty_output = true;
+    viewer.write_buf.clearRetainingCapacity();
+    daemon.appendResync(alloc, viewer, &term);
+    try std.testing.expect(!viewer.resync_pending);
+    try std.testing.expectEqual(@as(usize, 0), viewer.skipped_bytes);
+    try std.testing.expectEqual(viewer.write_buf.items.len, viewer.resync_bytes);
+    try std.testing.expectEqual(@as(?usize, @sizeOf(ipc.Header)), std.mem.indexOf(u8, viewer.write_buf.items, terminal.resync_prefix));
+    try std.testing.expect(std.mem.indexOf(u8, viewer.write_buf.items, "line 0") != null);
+
+    // The queued snapshot is not backlog: the next output is queued normally.
+    try viewer.queueLiveOutput(alloc, "after");
+    try std.testing.expect(!viewer.resync_pending);
+    try std.testing.expect(std.mem.endsWith(u8, viewer.write_buf.items, "after"));
+}
+
+test "a resync snapshot restores a client whose stream was cut mid-sequence" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    const size: ipc.Resize = .{ .cols = 40, .rows = 6 };
+
+    var source = try initTerminal(alloc, std.testing.io, size, &cfg);
+    defer source.deinit(alloc);
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    for (0..30) |i| {
+        var line: [48]u8 = undefined;
+        source_stream.nextSlice(try std.fmt.bufPrint(&line, "\x1b[1mhistory {d}\x1b[0m\r\n", .{i}));
+    }
+    source_stream.nextSlice("prompt> ");
+
+    // A viewer that saw part of an alternate-screen TUI with mouse reporting, cut inside an OSC.
+    var viewer = try initTerminal(alloc, std.testing.io, size, &cfg);
+    defer viewer.deinit(alloc);
+    var viewer_stream = viewer.vtStream();
+    defer viewer_stream.deinit();
+    viewer_stream.nextSlice("stale output\r\n\x1b[?1049h\x1b[?1000hfullscreen\x1b]0;unterminated title");
+
+    const resync = util.serializeResyncState(alloc, &source) orelse return error.TestUnexpectedNull;
+    defer alloc.free(resync);
+    viewer_stream.nextSlice(resync);
+
+    try std.testing.expect(viewer.screens.active_key == .primary);
+    try std.testing.expect(!viewer.modes.get(.mouse_event_normal));
+    try std.testing.expect(!viewer.modes.get(.synchronized_output));
+    const want = util.serializeTerminal(alloc, &source, .plain) orelse return error.TestUnexpectedNull;
+    defer alloc.free(want);
+    const got = util.serializeTerminal(alloc, &viewer, .plain) orelse return error.TestUnexpectedNull;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
 }
 
 test "send queues PTY input without changing leader" {

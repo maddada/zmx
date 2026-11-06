@@ -315,6 +315,30 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     };
 }
 
+/// Bytes that bring a terminal client which skipped live output back to the daemon's state.
+pub const resync_prefix =
+    // The reset the attach client itself writes before re-attaching on a session switch. Its
+    // leading ESC also ends a CSI, OSC or DCS the dropped output stopped inside.
+    "\x1bc\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\" ++
+    // Paint the snapshot once (closed by `resync_suffix`), then the attach client's clear.
+    "\x1b[?2026h\x1b[0m\x1b[2J\x1b[H";
+pub const resync_suffix = "\x1b[?2026l";
+
+/// CDXC:Zmx 2026-11-06 WHY:
+/// Snapshot for a terminal client that fell too far behind and skipped live output (loop.zig
+/// `Daemon.CLIENT_BACKLOG_MAX`). Its emulator holds a stream cut at an arbitrary point, so it is
+/// reset to what a fresh attach starts from (the reset a session switch already writes) and gets
+/// the attach snapshot: screen, history, modes, title and pwd. The synchronized-output pair makes a
+/// terminal that honours it paint the result once, as the visible refresh does.
+pub fn serializeResyncState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+    const state = serializeTerminalState(alloc, term) orelse return null;
+    defer alloc.free(state);
+    return std.mem.concat(alloc, u8, &.{ resync_prefix, state, resync_suffix }) catch |err| {
+        std.log.warn("failed to allocate resync state err={s}", .{@errorName(err)});
+        return null;
+    };
+}
+
 /// Serialize only the active viewport, as a clear-and-repaint snapshot.
 ///
 /// CDXC:Zmx 2026-05-20-09:57: Ghostex can ask an already attached
