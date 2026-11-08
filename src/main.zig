@@ -264,10 +264,13 @@ pub fn main(init: std.process.Init) !void {
         defer cmd_args_raw.deinit(gpa);
         var detached = false;
         var initial_command = false;
+        var foreground = false;
         while (args.next()) |arg| {
             // Once the command has started, -d belongs to the command.
             if (cmd_args_raw.items.len == 0 and std.mem.startsWith(u8, arg, "-d")) {
                 detached = true;
+            } else if (cmd_args_raw.items.len == 0 and std.mem.eql(u8, arg, "--foreground")) {
+                foreground = true;
             } else if (cmd_args_raw.items.len == 0 and std.mem.eql(u8, arg, "--initial-command")) {
                 // CDXC:Zmx 2026-06-08-21:18:
                 // Ghostex restore must create missing zmx providers with an
@@ -310,6 +313,10 @@ pub fn main(init: std.process.Init) !void {
         if (cmd_args_raw.items.len == 0 and stdin_bytes == null) {
             return printError(io, "run requires a command (or pipe input via stdin)", .{});
         }
+        // A foreground daemon never returns to the client code that would send a task's text.
+        if (foreground and !initial_command) {
+            return printError(io, "--foreground requires --initial-command", .{});
+        }
 
         const exit_code = zmx.run(gpa, io, session_name, cmd_args_raw.items, .{
             .detached = detached,
@@ -317,6 +324,7 @@ pub fn main(init: std.process.Init) !void {
             .shell = shell_env,
             .stdin_bytes = stdin_bytes,
             .initial_command = initial_command,
+            .foreground = foreground,
         }) catch |err| switch (err) {
             error.CommandRequired => return printError(io, "run requires a command (or pipe input via stdin)", .{}),
             else => return printError(io, "session not ready: {s}", .{@errorName(err)}),
@@ -605,6 +613,9 @@ fn help(io: std.Io) !void {
         \\  `--initial-command` creates a missing session by execing argv as
         \\  the initial process instead of sending command text through the PTY.
         \\  Existing sessions ignore the initial command.
+        \\  `--foreground` (with `--initial-command`) makes this process the
+        \\  daemon instead of forking one, for a launchd job whose own process
+        \\  should live as long as the session.
         \\
         \\  Examples:
         \\    zmx run dev ls
@@ -755,9 +766,10 @@ fn printVersion(io: std.Io, cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.Io.File.stdout().writer(io, &buf);
     // `wire_generation` is read by gxserver (CDXC:ZmxWireGeneration); keep the
-    // `<key>\t<value>` line shape.
+    // `<key>\t<value>` line shape. `foreground` tells gxserver this zmx
+    // understands `run --foreground` (an older one would run the flag as the command).
     try w.interface.print(
-        "zmx\t\t{s}\nghostty_vt\t{s}\nwire_generation\t{d}\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
+        "zmx\t\t{s}\nghostty_vt\t{s}\nwire_generation\t{d}\nforeground\t1\nsocket_dir\t{s}\nlog_dir\t\t{s}\n",
         .{ version, ghostty_version, ipc.WIRE_GENERATION, cfg.socket_dir, cfg.log_dir },
     );
     try w.interface.flush();

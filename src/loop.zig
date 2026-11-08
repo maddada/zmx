@@ -906,6 +906,8 @@ pub const Daemon = struct {
     /// is-daemon-proc return value cannot express on its own.
     created_session: bool = false,
     quiet: bool = false,
+    /// `run --foreground`: this process becomes the daemon, no fork (see daemonize()).
+    foreground: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
@@ -1080,6 +1082,7 @@ pub const Daemon = struct {
             sesh_name,
             cmd,
             &keep_fds_open,
+            self.foreground,
         ) catch |err| {
             switch (err) {
                 error.IsClientProc => {

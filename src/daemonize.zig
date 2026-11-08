@@ -177,24 +177,43 @@ pub fn spawnPty(sesh_name: []const u8, cmd: Cmd, size: ipc.Resize) !PtyInfo {
 ///                 ✝          │ PID≠SID → can't get a tty
 ///                            ▼
 ///                          DAEMON ✓
-pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32) !PtyInfo {
-    // creates the daemon
-    const pid = try lib_posix.fork();
-    assert(pid != -1);
+///
+/// `foreground` (`zmx run --foreground`) skips the first fork: the calling
+/// process itself becomes the daemon. setsid() still runs, and its EPERM is
+/// ignored because a launchd job's process already leads its own session.
+///
+/// CDXC:Zmx 2026-11-08 WHY: macOS charges a session's Local Network access to
+/// the process it holds responsible for the session's launchd job, which was
+/// the starter that forks the daemon and exits about 10 ms later. Local Network
+/// checks need that process alive, so every program in every session got
+/// EHOSTUNREACH even with Ghostex Sessions allowed (GitHub #504). Running the
+/// daemon as the job's own process keeps the responsible process alive exactly
+/// as long as the session. Disclaiming in the starter is not enough: a forked
+/// daemon inherits the starter's responsibility, and a running process cannot
+/// take responsibility for itself (`responsibility_set_caller_responsible_for_self`
+/// fails).
+pub fn daemonize(sesh_name: []const u8, cmd: Cmd, keep_fds_open: []i32, foreground: bool) !PtyInfo {
+    if (foreground) {
+        _ = lib_posix.setsid() catch {};
+    } else {
+        // creates the daemon
+        const pid = try lib_posix.fork();
+        assert(pid != -1);
 
-    if (pid > 0) { // parent (client)
-        // cannot use a passed-in io or alloc after a fork so we create what we need
-        // after the fork()
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        defer threaded.deinit();
-        const io = threaded.io();
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch unreachable;
-        return error.IsClientProc;
+        if (pid > 0) { // parent (client)
+            // cannot use a passed-in io or alloc after a fork so we create what we need
+            // after the fork()
+            var threaded: std.Io.Threaded = .init_single_threaded;
+            defer threaded.deinit();
+            const io = threaded.io();
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .real) catch unreachable;
+            return error.IsClientProc;
+        }
+
+        assert(pid == 0); // child (daemon's parent in double-fork)
+        // becomes the session leader and detaches process from its controlling terminal
+        _ = try lib_posix.setsid();
     }
-
-    assert(pid == 0); // child (daemon's parent in double-fork)
-    // becomes the session leader and detaches process from its controlling terminal
-    _ = try lib_posix.setsid();
 
     // Fetch terminal size before redirecting stdio FDs to /dev/null.
     const term_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);

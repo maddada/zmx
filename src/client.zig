@@ -51,6 +51,8 @@ pub const RunOptions = struct {
     /// Create a missing session with `command` as its initial process instead
     /// of typing it into a task-mode shell; an existing session ignores it.
     initial_command: bool = false,
+    /// Become the daemon in this process instead of forking one (`run --foreground`).
+    foreground: bool = false,
 };
 
 pub const KillOptions = struct {
@@ -464,6 +466,7 @@ pub fn run(
         // task-mode shell.
         daemon.command = if (opts.initial_command) command else null;
         daemon.is_task_mode = !opts.initial_command;
+        daemon.foreground = opts.foreground;
         if (opts.cwd) |cwd| daemon.setCwd(cwd);
         if (opts.shell) |sh| daemon.shell = sh;
         const is_daemon_proc = try daemon.ensureSession(io);
