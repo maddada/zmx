@@ -15,6 +15,7 @@ const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
 const terminal = @import("terminal.zig");
 const ghostty_vt = terminal.ghostty_vt;
+const kitty_replay = @import("kitty_replay.zig");
 
 /// Prompt-editor capability bits advertised by an attaching client on .Init.
 pub const prompt_editor_capability_monaco: u8 = 1;
@@ -367,11 +368,13 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
 }
 
 fn initTerminal(gpa: std.mem.Allocator, io: std.Io, size: ipc.Resize, cfg: *const Cfg) !ghostty_vt.Terminal {
+    kitty_replay.installPngDecoder();
     return ghostty_vt.Terminal.init(io, gpa, .{
         .cols = size.cols,
         .rows = size.rows,
         .max_scrollback_lines = cfg.max_scrollback_lines,
         .max_scrollback_bytes = null, // Let the line limit control scrollback.
+        .kitty_image_storage_limit = kitty_replay.storage_limit,
     });
 }
 

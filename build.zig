@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
         const vt_mod = d.module("ghostty-vt");
         if (target.result.os.tag == .openbsd) vt_mod.sanitize_c = .off;
         exe_mod.addImport("ghostty-vt", vt_mod);
+        addWuffs(exe_mod, vt_mod);
     }
 
     // zmx module: programmatic interface for embedding or external tools
@@ -83,6 +84,7 @@ pub fn build(b: *std.Build) void {
         const vt_mod = d.module("ghostty-vt");
         if (target.result.os.tag == .openbsd) vt_mod.sanitize_c = .off;
         zmx_pkg_mod.addImport("ghostty-vt", vt_mod);
+        addWuffs(zmx_pkg_mod, vt_mod);
     }
 
     // Examples: build the usage examples in examples/ against the zmx module
@@ -159,6 +161,7 @@ pub fn build(b: *std.Build) void {
             "ghostty-vt",
             test_dep.module("ghostty-vt"),
         );
+        addWuffs(test_module, test_dep.module("ghostty-vt"));
         const exe_unit_tests = b.addTest(.{
             .root_module = test_module,
             // .use_llvm = true,
@@ -219,6 +222,7 @@ pub fn build(b: *std.Build) void {
                 .@"emit-macos-app" = false,
             })) |release_dep| {
                 release_mod.addImport("ghostty-vt", release_dep.module("ghostty-vt"));
+                addWuffs(release_mod, release_dep.module("ghostty-vt"));
             }
 
             // const is_local_macos = resolved.result.os.tag == .macos;
@@ -253,4 +257,10 @@ pub fn build(b: *std.Build) void {
             release_step.dependOn(&install_sha.step);
         }
     }
+}
+
+/// The daemon decodes PNG pictures (Kitty graphics `f=100`) with the wuffs module ghostty-vt
+/// itself imports, so one copy of its C code links.
+fn addWuffs(mod: *std.Build.Module, vt_mod: *std.Build.Module) void {
+    if (vt_mod.import_table.get("wuffs")) |wuffs| mod.addImport("wuffs", wuffs);
 }

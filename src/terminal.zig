@@ -12,6 +12,7 @@ pub const ghostty_vt = if (has_daemon) @import("ghostty-vt") else struct {
 };
 
 pub const HistoryFormat = util.HistoryFormat;
+const kitty_replay = if (has_daemon) @import("kitty_replay.zig") else struct {};
 
 /// Detect keyboard input that should transfer ownership to the sending client.
 ///
@@ -309,6 +310,7 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         std.log.warn("failed to format terminal state err={s}", .{@errorName(err)});
         return null;
     };
+    kitty_replay.write(alloc, &builder.writer, term, .fresh) catch return null;
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
@@ -427,6 +429,7 @@ pub fn serializeVisibleTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt
         std.log.warn("failed to format visible terminal state err={s}", .{@errorName(err)});
         return null;
     };
+    kitty_replay.write(alloc, &builder.writer, term, .screen_cleared) catch return null;
 
     if (!had_wraparound) builder.writer.writeAll("\x1b[?7l") catch return null;
     writePwd(&builder.writer, term);
