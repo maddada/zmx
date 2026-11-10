@@ -79,6 +79,27 @@ pub fn isUserInput(payload: []const u8) bool {
     return false;
 }
 
+/// Where an escape sequence that `payload` does not finish starts, or
+/// `payload.len` when it ends between sequences. A single Escape at the very
+/// end is the Escape key, not an open sequence.
+/// CDXC:Zmx 2026-11-10 WHY:
+/// A terminal's answer to a query can reach the daemon in two reads (a Windows computer attached over ssh answered Device Attributes as `ESC[?61;4;6;7;14;21;22;` then `23;24;28;32;42c`). Judged alone, the second read is plain text: the viewer that only answered became the leader, resized the session, and "23;24;28;32;42c" was typed into the agent's prompt on every switch to the terminal on the other computer. `Daemon.handleInput` keeps the open part and judges it with the next read.
+pub fn unfinishedSequenceStart(payload: []const u8) usize {
+    var parser = ghostty_vt.Parser.init();
+    var start: usize = payload.len;
+    for (payload, 0..) |byte, i| {
+        const was_ground = parser.state == .ground;
+        _ = parser.next(byte);
+        if (parser.state == .ground) {
+            start = payload.len;
+        } else if (was_ground) {
+            start = i;
+        }
+    }
+    if (parser.state == .escape and start + 1 == payload.len) return payload.len;
+    return start;
+}
+
 /// CDXC:Zmx 2026-09-29 WHY:
 /// A client that attached while a full-screen TUI held the alternate screen (Codex's fullscreen view, its default since 0.157, or Claude Code) received only that grid, so its primary screen came up empty: the shell history from before the TUI was gone from that client, which showed a blank terminal once the TUI quit. The primary screen's history, grid and cursor are written first, the way ghostty's formatter documents replaying every screen; the active-screen replay that follows enters the alternate screen with `?1049h`, which saves exactly this cursor for the TUI's exit to restore. wmx cannot do the same: its vt100 grid exposes only the active screen.
 fn writePrimaryBehindAlternate(writer: *std.Io.Writer, term: *const ghostty_vt.Terminal) !void {

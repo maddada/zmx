@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const has_daemon = if (@hasDecl(build_options, "has_daemon")) build_options.has_daemon else true;
 pub const terminal = if (has_daemon) @import("terminal.zig") else struct {};
 pub const isUserInput = if (has_daemon) terminal.isUserInput else struct {};
+pub const unfinishedSequenceStart = if (has_daemon) terminal.unfinishedSequenceStart else struct {};
 pub const serializeTerminalState = if (has_daemon) terminal.serializeTerminalState else struct {};
 pub const serializeTerminal = if (has_daemon) terminal.serializeTerminal else struct {};
 pub const serializeTerminalRange = if (has_daemon) terminal.serializeTerminalRange else struct {};

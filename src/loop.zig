@@ -645,7 +645,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(gpa, client, msg.payload),
+                        .Input => try daemon.handleInput(gpa, client, msg.payload, nowMs(io)),
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .SendAcked => try daemon.handleSendAcked(gpa, client, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
@@ -787,6 +787,10 @@ pub const Client = struct {
     activity: u64 = 0,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    /// The escape sequence this client's last read left open while it was not the leader,
+    /// kept to be judged with the next read (`Daemon.handleInput`).
+    held_input: std.ArrayList(u8) = .empty,
+    held_input_at_ms: i64 = 0,
     env_str: ?[]u8 = null,
     /// CDXC:Zmx 2026-11-06: this terminal client fell more than `Daemon.CLIENT_BACKLOG_MAX`
     /// behind, so live output is no longer queued for it; once `write_buf` drains it gets one
@@ -835,6 +839,7 @@ pub const Client = struct {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+        self.held_input.deinit(gpa);
         if (self.env_str) |s| gpa.free(s);
     }
 
@@ -1460,11 +1465,35 @@ pub const Daemon = struct {
         return .queued;
     }
 
-    pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+    /// An open escape sequence is only joined to a read that follows this soon: the two halves
+    /// of one answer arrive together, while an Alt+[ typed long ago must not swallow the next key.
+    const HELD_INPUT_MAX_AGE_MS: i64 = 2000;
+    /// Enough of an open sequence to know which kind it is; the rest of a long one is not kept.
+    const HELD_INPUT_MAX: usize = 4096;
+
+    pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8, now_ms: i64) !void {
         // NOTE: for local dev only
         // std.log.debug("buffering pty input data={x}", .{payload});
 
-        const is_user_input = util.isUserInput(payload);
+        // The sequence this client's last read left open comes first again.
+        var input = payload;
+        var joined = false;
+        if (client.held_input.items.len > 0) {
+            if (now_ms - client.held_input_at_ms <= HELD_INPUT_MAX_AGE_MS) {
+                if (client.held_input.appendSlice(gpa, payload)) {
+                    input = client.held_input.items;
+                    joined = true;
+                } else |_| {}
+            }
+            if (!joined) client.held_input.clearRetainingCapacity();
+        }
+
+        // Only a client that is not the leader waits for the rest of a sequence: the leader's
+        // bytes all reach the program, in order.
+        const is_leader = self.leader_client_fd == client.socket_fd;
+        const whole = if (is_leader) input.len else util.unfinishedSequenceStart(input);
+
+        const is_user_input = util.isUserInput(input[0..whole]);
         if (is_user_input) {
             // A keystroke proves someone is at this terminal.
             client.visibility = .visible;
@@ -1472,18 +1501,33 @@ pub const Daemon = struct {
         }
 
         // client is leader, send entire payload (ansi escape codes + text)
-        if (self.leader_client_fd == client.socket_fd) {
-            self.program_status.noteInput(payload);
-            self.queuePtyInput(gpa, payload);
+        if (is_leader) {
+            self.program_status.noteInput(input);
+            self.queuePtyInput(gpa, input);
+            client.held_input.clearRetainingCapacity();
             return;
         }
 
         // check if leader needs to be updated by detecting any user input
         if (is_user_input) {
             try self.setLeader(gpa, client);
-            self.program_status.noteInput(payload);
-            self.queuePtyInput(gpa, payload);
+            self.program_status.noteInput(input);
+            self.queuePtyInput(gpa, input);
+            client.held_input.clearRetainingCapacity();
+            return;
         }
+
+        // Nothing typed: what this terminal answered is dropped, and a sequence the read left
+        // open waits for its end (see `unfinishedSequenceStart`).
+        const open = input[whole..@min(input.len, whole + HELD_INPUT_MAX)];
+        if (joined) {
+            std.mem.copyForwards(u8, client.held_input.items[0..open.len], open);
+            client.held_input.shrinkRetainingCapacity(open.len);
+        } else {
+            client.held_input.clearRetainingCapacity();
+            client.held_input.appendSlice(gpa, open) catch {};
+        }
+        client.held_input_at_ms = now_ms;
     }
 
     /// Queue input from `zmx send` without changing interactive client leadership.
