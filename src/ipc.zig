@@ -137,6 +137,13 @@ pub const Tag = enum(u8) {
     ProgramStatusSubscribe = 211,
     /// Daemon -> client: one JSON object `{"reported":bool,"records":[...]}` (no trailing newline).
     ProgramStatus = 212,
+    /// CDXC:Zmx 2026-11-12 WHY:
+    /// Client -> daemon, empty payload: repaint this client's screen only, as `Refresh` repaints
+    /// every terminal client. An attach client that held back output while its phone tab was hidden
+    /// (`ZMX_PAUSE=1`) asks for it on resume, so other clients (a desktop pane) are not repainted and
+    /// scrolled. Additive, so no WIRE_GENERATION bump: an old daemon answers `Unsupported`, and the
+    /// client then sends `Refresh` instead.
+    RefreshSelf = 213,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
     // rather than UB. Switches must handle `_` (unknown tag).

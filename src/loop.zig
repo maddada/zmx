@@ -32,6 +32,10 @@ pub const ghostex_refresh_sequence = "\x1b]1337;ZMX_REFRESH\x07";
 ///   VISIBLE=<rows>,<cols> -> `.Visibility{ state = .visible, resize = rows x cols }`
 ///   CHAT=<rows>,<cols>    -> `.Visibility{ state = .chat, resize = rows x cols }`
 ///   HIDDEN=<rows>,<cols>  -> `.Visibility{ state = .parked, resize = rows x cols }`
+///   PAUSE=1 / PAUSE=0     -> no IPC: this attach client holds back the daemon's output, or
+///                            resumes and asks for a repaint (`ClientDisplay`)
+///   BATCH=<ms>            -> no IPC: this attach client gathers output for up to <ms> (0 to 250)
+///                            before writing it (`ClientDisplay`)
 /// `<rows>` and `<cols>` are decimal u16, both > 0. A terminated sequence with
 /// any other body (unknown name, missing comma, zero, overflow, junk) is
 /// consumed and dropped: the ZMX_ namespace is ours, so its control bytes are
@@ -42,6 +46,8 @@ pub const ghostex_osc_prefix = "\x1b]1337;ZMX_";
 pub const ghostex_visible_body_prefix = "VISIBLE=";
 pub const ghostex_chat_body_prefix = "CHAT=";
 pub const ghostex_hidden_body_prefix = "HIDDEN=";
+pub const ghostex_pause_body_prefix = "PAUSE=";
+pub const ghostex_batch_body_prefix = "BATCH=";
 const ghostex_refresh_body = "REFRESH";
 const osc_bel: u8 = 0x07;
 
@@ -52,6 +58,8 @@ fn nowMs(io: std.Io) i64 {
 const GhostexOscMessage = union(enum) {
     refresh,
     visibility: ipc.Visibility,
+    pause: bool,
+    batch: u16,
     /// Terminated but not a message we understand: consume silently.
     malformed,
 };
@@ -79,7 +87,59 @@ fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
         const resize = parseRowsCols(body[ghostex_hidden_body_prefix.len..]) orelse return .malformed;
         return .{ .visibility = .{ .state = .parked, .resize = resize } };
     }
+    if (std.mem.startsWith(u8, body, ghostex_pause_body_prefix)) {
+        const value = body[ghostex_pause_body_prefix.len..];
+        if (std.mem.eql(u8, value, "1")) return .{ .pause = true };
+        if (std.mem.eql(u8, value, "0")) return .{ .pause = false };
+        return .malformed;
+    }
+    if (std.mem.startsWith(u8, body, ghostex_batch_body_prefix)) {
+        const ms = std.fmt.parseInt(u16, body[ghostex_batch_body_prefix.len..], 10) catch return .malformed;
+        if (ms > client_batch_max_ms) return .malformed;
+        return .{ .batch = ms };
+    }
     return .malformed;
+}
+
+/// The longest gathering an outer terminal may ask for with `ZMX_BATCH`.
+const client_batch_max_ms: u16 = 250;
+/// Gathered output this large goes out at once, whatever is left of the batch window.
+const client_batch_flush_bytes: usize = 32 * 1024;
+/// Output within this long of the outer terminal's last keystroke is written at once, so typing
+/// echoes without the batch delay; only output nobody is typing into is gathered.
+const client_batch_typing_ms: i64 = 150;
+
+/// CDXC:Zmx 2026-11-12 DECISION:
+/// The user chose to quiet the terminals the phone cannot see (Q2720, "quiet hidden terminals"): every warm terminal tab kept receiving all of a working agent's output over the phone's link (151 KiB a minute and 36 writes a second measured for one agent), shown or not. Only the phone opts in, through two private OSCs this attach client consumes itself: `ZMX_PAUSE=1` while its tab is hidden or shows the session's chat (the client drops the daemon's output, so nothing crosses the link) and `ZMX_PAUSE=0` when the terminal is shown (the client asks the daemon to repaint it, `RefreshSelf`, or `Refresh` from a daemon too old to know it), and `ZMX_BATCH=<ms>` to write output in fewer, larger pieces. A desktop pane, the web terminal and a plain `ghostex attach` never send them and are unchanged; an older attach client drops both as malformed Ghostex OSCs.
+/// SEE-ALSO: apps/mobile/app/src/terminal/zmxDisplay.ts (the sender), `terminalPause` in server/src/cli.rs.
+pub const ClientDisplay = struct {
+    paused: bool = false,
+    /// Output was dropped while paused, so the resume needs a repaint.
+    dropped: bool = false,
+    /// A resume asked for a repaint that has not been answered yet.
+    awaiting_repaint: bool = false,
+    /// The resume's repaint request is due on the daemon socket.
+    repaint_due: bool = false,
+    batch_ms: u16 = 0,
+
+    /// Whether gathered output waits (`ZMX_BATCH`): the window is open, it is not large yet, and
+    /// nobody typed just now.
+    fn holds(self: *const ClientDisplay, gathered: usize, gathered_since_ms: i64, typed_at_ms: i64, now_ms: i64) bool {
+        return self.batch_ms > 0 and gathered > 0 and gathered < client_batch_flush_bytes and
+            now_ms - gathered_since_ms < self.batch_ms and now_ms - typed_at_ms >= client_batch_typing_ms;
+    }
+
+    fn setPaused(self: *ClientDisplay, paused: bool) void {
+        if (self.paused and !paused and self.dropped) self.repaint_due = true;
+        if (!paused) self.dropped = false;
+        self.paused = paused;
+    }
+};
+
+fn monotonicMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
@@ -95,6 +155,16 @@ fn parseGhostexOscBody(body: []const u8) GhostexOscMessage {
 const CLIENT_STDOUT_BACKLOG_MAX: usize = 256 * 1024;
 
 fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayList(u8), input: []const u8) !void {
+    return appendClientInputMessagesFor(gpa, sock_write_buf, input, null);
+}
+
+/// `display` takes the OSCs that steer this attach client itself (`ZMX_PAUSE`, `ZMX_BATCH`).
+fn appendClientInputMessagesFor(
+    gpa: std.mem.Allocator,
+    sock_write_buf: *std.ArrayList(u8),
+    input: []const u8,
+    display: ?*ClientDisplay,
+) !void {
     var remaining = input;
     while (std.mem.indexOf(u8, remaining, ghostex_osc_prefix)) |index| {
         const tail = remaining[index..];
@@ -112,6 +182,10 @@ fn appendClientInputMessages(gpa: std.mem.Allocator, sock_write_buf: *std.ArrayL
                 .Visibility,
                 &visibility.encode(),
             ),
+            .pause => |paused| if (display) |state| state.setPaused(paused),
+            .batch => |ms| if (display) |state| {
+                state.batch_ms = ms;
+            },
             .malformed => std.log.warn("dropping malformed Ghostex OSC len={d}", .{bel + 1}),
         }
         remaining = tail[bel + 1 ..];
@@ -206,9 +280,19 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
     defer _ = lib_posix.fcntl(stdin_fd, lib_posix.F.SETFL, stdin_orig_flags) catch {};
 
     const detach_key_disabled = util.isDetachKeyDisabled();
+    var display = ClientDisplay{};
+    // When the gathered output started waiting, and the last keystroke (`ZMX_BATCH`).
+    var gathered_since_ms: i64 = 0;
+    var typed_at_ms: i64 = 0;
 
     while (true) {
         poll_fds.clearRetainingCapacity();
+        // Gathering (`ZMX_BATCH`): hold the write until the window closes or enough has gathered.
+        const holding = display.holds(stdout_buf.items.len, gathered_since_ms, typed_at_ms, monotonicMs());
+        const poll_timeout: i32 = if (holding)
+            @intCast(@max(1, @as(i64, display.batch_ms) - (monotonicMs() - gathered_since_ms)))
+        else
+            -1;
 
         try poll_fds.append(gpa, .{
             .fd = stdin_fd,
@@ -234,7 +318,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
 
         try poll_fds.append(gpa, .{ .fd = signal.sig_pipe[0], .events = lib_posix.POLL.IN, .revents = 0 });
 
-        if (stdout_buf.items.len > 0) {
+        if (stdout_buf.items.len > 0 and !holding) {
             try poll_fds.append(gpa, .{
                 .fd = lib_posix.STDOUT_FILENO,
                 .events = lib_posix.POLL.OUT,
@@ -242,7 +326,7 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -266,12 +350,19 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
 
             if (n_opt) |n| {
                 if (n > 0) {
+                    // A keystroke (not a Ghostex OSC): its echo is written without the batch delay.
+                    if (std.mem.indexOf(u8, buf[0..n], ghostex_osc_prefix) == null) typed_at_ms = monotonicMs();
                     // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
                     if (!detach_key_disabled and util.isCtrlBackslash(buf[0..n])) {
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try appendClientInputMessages(gpa, &sock_write_buf, buf[0..n]);
+                        try appendClientInputMessagesFor(gpa, &sock_write_buf, buf[0..n], &display);
+                        if (display.repaint_due) {
+                            display.repaint_due = false;
+                            display.awaiting_repaint = true;
+                            try ipc.appendMessage(gpa, &sock_write_buf, .RefreshSelf, "");
+                        }
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -300,9 +391,18 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
             while (read_buf.next()) |msg| {
                 switch (msg.header.tag) {
                     .Output => {
-                        if (msg.payload.len > 0) {
+                        if (display.paused) {
+                            if (msg.payload.len > 0) display.dropped = true;
+                        } else if (msg.payload.len > 0) {
+                            if (stdout_buf.items.len == 0) gathered_since_ms = monotonicMs();
                             try stdout_buf.appendSlice(gpa, msg.payload);
+                            display.awaiting_repaint = false;
                         }
+                    },
+                    // A daemon too old for `RefreshSelf` repaints every terminal client instead.
+                    .Unsupported => if (display.awaiting_repaint) {
+                        display.awaiting_repaint = false;
+                        try ipc.appendMessage(gpa, &sock_write_buf, .Refresh, "");
                     },
                     .Resize => {
                         // daemon is asking for the client's window size usually in response
@@ -350,7 +450,8 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8, prompt_editor_capabi
             }
         }
 
-        if (stdout_buf.items.len > 0) {
+        // Asked again: output read in this pass may start a new gathering window.
+        if (stdout_buf.items.len > 0 and !display.holds(stdout_buf.items.len, gathered_since_ms, typed_at_ms, monotonicMs())) {
             const n = lib_posix.write(lib_posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                 if (err == error.WouldBlock) break :blk 0;
                 return err;
@@ -676,6 +777,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .Refresh => try daemon.handleRefresh(gpa, client, &term),
+                        .RefreshSelf => daemon.appendVisibleRefresh(gpa, client, &term),
                         .RefreshIfStale => try daemon.handleRefreshIfStale(gpa, client, pty_fd, &term, msg.payload),
                         .PromptEditorCapability => try daemon.handlePromptEditorCapability(gpa, client),
                         .Visibility => try daemon.handleVisibility(gpa, client, msg.payload),
